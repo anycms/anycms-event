@@ -1,7 +1,6 @@
 # Rust 开发约定
 
 ## 项目开发约定
-- 不修改 Cargo.toml ,如需添加修改依赖，需要用户手动添加
 - 使用 anyhow 和 thiserror 进行错误处理
 - 使用 tokio 作为异步运行时
 - 使用 cargo check 检测代码错误

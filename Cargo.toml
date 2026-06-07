@@ -1,6 +1,29 @@
+[workspace]
+members = [
+    ".",
+    "crates/anycms-event-derive",
+    "crates/anycms-event-redis",
+]
+resolver = "3"
+
 [package]
 name = "anycms-event"
 version = "0.1.0"
 edition = "2024"
+description = "A type-safe, async event bus system for AnyCMS"
+license = "MIT"
 
 [dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+anycms-event-derive = { path = "crates/anycms-event-derive" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+anycms-event-redis = { path = "crates/anycms-event-redis" }
+actix-web = "4"
+axum = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

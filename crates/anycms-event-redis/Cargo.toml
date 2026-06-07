@@ -1,0 +1,16 @@
+[package]
+name = "anycms-event-redis"
+version = "0.1.0"
+edition = "2024"
+description = "Redis transport for anycms-event distributed event bus"
+license = "MIT"
+
+[dependencies]
+anycms-event = { path = "../.." }
+tokio = { version = "1", features = ["sync", "rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+futures-util = "0.3"
