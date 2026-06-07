@@ -6,20 +6,39 @@ members = [
 ]
 resolver = "3"
 
-[package]
-name = "anycms-event"
+[workspace.package]
 version = "0.1.0"
-edition = "2024"
-description = "A type-safe, async event bus system for AnyCMS"
 license = "MIT"
+homepage = "https://anycms.org"
+edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-anycms-event-derive = { path = "crates/anycms-event-derive" }
+futures-util = "0.3"
+anycms-event-derive = { version = "0.1.0", path = "crates/anycms-event-derive" }
+anycms-event = { version = "0.1.0", path = "." }
+
+# ── anycms-event (core) ──────────────────────────────────────
+
+[package]
+name = "anycms-event"
+description = "A type-safe, async event bus system for AnyCMS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+anycms-event-derive.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }

@@ -1,9 +1,10 @@
 [package]
 name = "anycms-event-derive"
-version = "0.1.0"
-edition = "2024"
 description = "Procedural macros for anycms-event"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
 
 [lib]
 proc-macro = true
