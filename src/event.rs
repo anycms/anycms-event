@@ -39,4 +39,12 @@ pub trait Event: Clone + Send + Sync + 'static {
     {
         Self::event_name()
     }
+
+    /// Serialize event to JSON for observers like TriggerRuleEngine.
+    /// Returns `None` by default — events that implement `Serialize` can override
+    /// to provide their JSON representation.
+    fn to_json(&self) -> Option<serde_json::Value> {
+        let _ = self;
+        None
+    }
 }

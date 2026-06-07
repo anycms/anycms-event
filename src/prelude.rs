@@ -6,7 +6,7 @@
 
 pub use crate::error::{EventBusError, PublishErrorReason, Result};
 pub use crate::event::Event;
-pub use crate::bus::{EventBus, Subscription};
+pub use crate::bus::{EventBus, Subscription, RetryPolicy, RetryBackoff, DeadLetterHandler, LoggingDeadLetterHandler};
 pub use crate::topic;
 pub use crate::telemetry::Telemetry;
 pub use crate::registry::{EventDescriptor, EventQuery, EventRegistry};
@@ -15,4 +15,7 @@ pub use crate::execution_log::{
     ExecutionRecord, ExecutionLogTelemetry, ExecutionStatus, ExecutionType,
     InMemoryExecutionLog,
 };
-pub use crate::trigger::{TriggerRule, TriggerRuleEngine, TriggerContext, TriggerEvent};
+pub use crate::trigger::{
+    TriggerRule, TriggerRuleEngine, TriggerContext, TriggerEvent,
+    RuleStorage, InMemoryRuleStorage,
+};

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::bus::EventBus;
+use crate::bus::{EventBus, RetryPolicy, DeadLetterHandler};
 use crate::execution_log::ExecutionLog;
 use crate::registry::EventRegistry;
 use crate::telemetry::Telemetry;
@@ -28,6 +28,8 @@ pub struct EventBusBuilder {
     telemetry: Option<Arc<dyn Telemetry>>,
     registry: Option<Arc<EventRegistry>>,
     execution_log: Option<Arc<ExecutionLog>>,
+    retry_policy: RetryPolicy,
+    dead_letter: Option<Arc<dyn DeadLetterHandler>>,
 }
 
 impl EventBusBuilder {
@@ -40,6 +42,8 @@ impl EventBusBuilder {
             telemetry: None,
             registry: None,
             execution_log: None,
+            retry_policy: RetryPolicy::default(),
+            dead_letter: None,
         }
     }
 
@@ -76,10 +80,33 @@ impl EventBusBuilder {
         self
     }
 
+    /// 设置 Handler 重试策略。
+    ///
+    /// 默认不重试（`max_retries: 0`）。
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// 设置死信处理器。
+    ///
+    /// 当 Handler 重试耗尽后，将调用死信处理器。
+    pub fn dead_letter_handler<H: DeadLetterHandler>(mut self, handler: H) -> Self {
+        self.dead_letter = Some(Arc::new(handler));
+        self
+    }
+
     /// 消费构建器并返回配置好的 [`EventBus`]。
     pub fn build(self) -> EventBus {
         let registry = self.registry.unwrap_or_else(|| Arc::new(EventRegistry::new()));
-        EventBus::from_builder(self.capacity, self.telemetry, registry, self.execution_log)
+        EventBus::from_builder(
+            self.capacity,
+            self.telemetry,
+            registry,
+            self.execution_log,
+            self.retry_policy,
+            self.dead_letter,
+        )
     }
 }
 

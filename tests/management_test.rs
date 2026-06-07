@@ -608,3 +608,36 @@ async fn test_full_management_stack() {
     assert_eq!(triggered.len(), 1);
     assert_eq!(triggered[0], "generate-sitemap");
 }
+
+// ── P1-1: RuleStorage 自定义存储测试 ──────────────────────────────
+
+#[test]
+fn test_trigger_engine_with_custom_storage() {
+    // 使用 InMemoryRuleStorage 但通过 trait 指针验证自定义存储注入
+    let storage: Arc<dyn RuleStorage> = Arc::new(InMemoryRuleStorage::new());
+    let bus = EventBus::new();
+    let engine = TriggerRuleEngine::with_storage(bus, storage.clone());
+
+    engine.add_rule(TriggerRule {
+        id: "r1".to_string(),
+        name: "Test Rule".to_string(),
+        event_pattern: "user.*".to_string(),
+        condition: None,
+        action_type: "log".to_string(),
+        action_config: json!({}),
+        enabled: true,
+        priority: 0,
+    });
+
+    // 通过 storage 直接验证
+    assert_eq!(storage.count(), 1);
+    assert_eq!(storage.get("r1").unwrap().name, "Test Rule");
+
+    // 通过 engine 验证
+    assert_eq!(engine.rule_count(), 1);
+    assert_eq!(engine.list_rules()[0].id, "r1");
+
+    // 通过 engine 删除，storage 同步更新
+    engine.remove_rule("r1");
+    assert_eq!(storage.count(), 0);
+}

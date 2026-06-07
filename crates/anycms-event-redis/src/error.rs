@@ -25,3 +25,17 @@ pub enum RedisTransportError {
 
 /// Convenience alias for results using [`RedisTransportError`].
 pub type Result<T> = std::result::Result<T, RedisTransportError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_display() {
+        let err = RedisTransportError::ConnectionError("timeout".to_string());
+        assert!(err.to_string().contains("timeout"));
+
+        let err = RedisTransportError::PublishError("channel full".to_string());
+        assert!(err.to_string().contains("channel full"));
+    }
+}

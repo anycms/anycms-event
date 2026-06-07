@@ -8,7 +8,7 @@ homepage.workspace = true
 
 [dependencies]
 anycms-event.workspace = true
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

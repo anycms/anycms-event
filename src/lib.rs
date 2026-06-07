@@ -39,6 +39,7 @@ pub mod builder;
 pub mod registry;
 pub mod execution_log;
 pub mod trigger;
+pub mod transport;
 
 pub mod prelude;
 
@@ -46,6 +47,7 @@ pub mod prelude;
 pub use error::{EventBusError, Result};
 pub use event::Event;
 pub use bus::EventBus;
+pub use trigger::RuleStorage;
 
 #[cfg(feature = "testing")]
 pub mod testing;

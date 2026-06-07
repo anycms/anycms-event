@@ -120,39 +120,170 @@ fn default_true() -> bool {
     true
 }
 
+// ── RuleStorage trait ──────────────────────────────────────────────
+
+/// 触发规则存储后端 trait。
+///
+/// 实现此 trait 以自定义规则持久化方式（如数据库、文件等）。
+/// 默认提供 [`InMemoryRuleStorage`]（内存存储）。
+///
+/// # Example
+///
+/// ```ignore
+/// use anycms_event::trigger::{RuleStorage, TriggerRule, InMemoryRuleStorage};
+///
+/// let storage = Arc::new(InMemoryRuleStorage::new());
+/// let engine = TriggerRuleEngine::with_storage(bus, storage.clone());
+/// ```
+pub trait RuleStorage: Send + Sync + 'static {
+    /// 添加一条规则。
+    fn add(&self, rule: TriggerRule);
+
+    /// 移除一条规则（按 ID）。返回被移除的规则。
+    fn remove(&self, rule_id: &str) -> Option<TriggerRule>;
+
+    /// 获取指定 ID 的规则。
+    fn get(&self, rule_id: &str) -> Option<TriggerRule>;
+
+    /// 更新一条规则（根据 rule.id 查找并替换）。返回是否成功。
+    fn update(&self, rule: TriggerRule) -> bool;
+
+    /// 获取所有规则（按 priority 排序）。
+    fn list(&self) -> Vec<TriggerRule>;
+
+    /// 获取规则数量。
+    fn count(&self) -> usize;
+}
+
+// ── InMemoryRuleStorage ────────────────────────────────────────────
+
+/// 内存规则存储。
+///
+/// 使用 `RwLock<Vec<TriggerRule>>` 存储规则，添加时按 priority 排序。
+pub struct InMemoryRuleStorage {
+    rules: RwLock<Vec<TriggerRule>>,
+}
+
+impl InMemoryRuleStorage {
+    /// 创建新的内存规则存储。
+    pub fn new() -> Self {
+        Self {
+            rules: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+impl Default for InMemoryRuleStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RuleStorage for InMemoryRuleStorage {
+    fn add(&self, rule: TriggerRule) {
+        let mut rules = self.rules.write().unwrap();
+        rules.push(rule);
+        rules.sort_by_key(|r| r.priority);
+    }
+
+    fn remove(&self, rule_id: &str) -> Option<TriggerRule> {
+        let mut rules = self.rules.write().unwrap();
+        let pos = rules.iter().position(|r| r.id == rule_id)?;
+        Some(rules.remove(pos))
+    }
+
+    fn get(&self, rule_id: &str) -> Option<TriggerRule> {
+        self.rules
+            .read()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == rule_id)
+            .cloned()
+    }
+
+    fn update(&self, rule: TriggerRule) -> bool {
+        let mut rules = self.rules.write().unwrap();
+        if let Some(pos) = rules.iter().position(|r| r.id == rule.id) {
+            rules[pos] = rule;
+            rules.sort_by_key(|r| r.priority);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn list(&self) -> Vec<TriggerRule> {
+        self.rules.read().unwrap().clone()
+    }
+
+    fn count(&self) -> usize {
+        self.rules.read().unwrap().len()
+    }
+}
+
+// ── TriggerEngineState ────────────────────────────────────────────
+
+/// Internal state of the trigger engine, shared via Arc between the engine
+/// and the publish callback spawned tasks.
+struct TriggerEngineState {
+    storage: Arc<dyn RuleStorage>,
+    actions: RwLock<HashMap<String, TriggerActionFn>>,
+    running: AtomicBool,
+}
+
 // ── TriggerRuleEngine ─────────────────────────────────────────────
 
 /// 触发规则引擎。
 ///
-/// 订阅 EventBus 上的所有事件，根据配置的规则匹配事件并执行对应的动作。
+/// 通过 EventBus 的 publish callback 机制监听所有事件，根据配置的规则匹配事件并执行对应的动作。
 ///
 /// # 生命周期
 ///
 /// 1. 创建引擎（`new`）
 /// 2. 注册 action handlers（`register_action`）
 /// 3. 添加规则（`add_rule` / `add_rules`）
-/// 4. 启动引擎（`start`）- 开始监听事件
+/// 4. 启动引擎（`start`）- 注册 publish callback 开始监听事件
 /// 5. 运行时管理规则（`update_rule`, `remove_rule`, `enable_rule`, `disable_rule`）
 pub struct TriggerRuleEngine {
     bus: EventBus,
-    rules: RwLock<Vec<TriggerRule>>,
-    actions: RwLock<HashMap<String, TriggerActionFn>>,
-    running: AtomicBool,
-    subscription: RwLock<Option<crate::bus::Subscription>>,
+    state: Arc<TriggerEngineState>,
 }
 
 impl TriggerRuleEngine {
     /// 创建一个新的触发规则引擎。
     ///
     /// 引擎创建后需要调用 [`start`](Self::start) 开始监听事件。
+    /// 默认使用 [`InMemoryRuleStorage`]（内存存储）。
     pub fn new(bus: EventBus) -> Self {
         Self {
             bus,
-            rules: RwLock::new(Vec::new()),
-            actions: RwLock::new(HashMap::new()),
-            running: AtomicBool::new(false),
-            subscription: RwLock::new(None),
+            state: Arc::new(TriggerEngineState {
+                storage: Arc::new(InMemoryRuleStorage::new()),
+                actions: RwLock::new(HashMap::new()),
+                running: AtomicBool::new(false),
+            }),
         }
+    }
+
+    /// 使用自定义存储后端创建触发规则引擎。
+    ///
+    /// 用于需要持久化规则到数据库或其他存储的场景。
+    pub fn with_storage(bus: EventBus, storage: Arc<dyn RuleStorage>) -> Self {
+        Self {
+            bus,
+            state: Arc::new(TriggerEngineState {
+                storage,
+                actions: RwLock::new(HashMap::new()),
+                running: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// 获取存储后端引用。
+    ///
+    /// 用于高级管理操作，如批量导入/导出规则。
+    pub fn storage(&self) -> &Arc<dyn RuleStorage> {
+        &self.state.storage
     }
 
     /// 注册一个动作处理器。
@@ -168,7 +299,8 @@ impl TriggerRuleEngine {
             Box::pin(fut)
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         });
-        self.actions
+        self.state
+            .actions
             .write()
             .unwrap()
             .insert(action_type.to_string(), wrapped);
@@ -176,48 +308,35 @@ impl TriggerRuleEngine {
 
     /// 添加一条触发规则。
     pub fn add_rule(&self, rule: TriggerRule) {
-        let mut rules = self.rules.write().unwrap();
-        rules.push(rule);
-        // 按 priority 排序
-        rules.sort_by_key(|r| r.priority);
+        self.state.storage.add(rule);
     }
 
     /// 批量添加触发规则。
     pub fn add_rules(&self, new_rules: Vec<TriggerRule>) {
-        let mut rules = self.rules.write().unwrap();
-        rules.extend(new_rules);
-        rules.sort_by_key(|r| r.priority);
+        for rule in new_rules {
+            self.state.storage.add(rule);
+        }
     }
 
     /// 移除一条规则（按 ID）。
     ///
     /// 返回被移除的规则（如果存在）。
     pub fn remove_rule(&self, rule_id: &str) -> Option<TriggerRule> {
-        let mut rules = self.rules.write().unwrap();
-        let pos = rules.iter().position(|r| r.id == rule_id)?;
-        Some(rules.remove(pos))
+        self.state.storage.remove(rule_id)
     }
 
     /// 更新一条规则。
     ///
     /// 根据 `rule.id` 查找并替换。
     pub fn update_rule(&self, rule: TriggerRule) -> bool {
-        let mut rules = self.rules.write().unwrap();
-        if let Some(pos) = rules.iter().position(|r| r.id == rule.id) {
-            rules[pos] = rule;
-            rules.sort_by_key(|r| r.priority);
-            true
-        } else {
-            false
-        }
+        self.state.storage.update(rule)
     }
 
     /// 启用一条规则。
     pub fn enable_rule(&self, rule_id: &str) -> bool {
-        let mut rules = self.rules.write().unwrap();
-        if let Some(rule) = rules.iter_mut().find(|r| r.id == rule_id) {
+        if let Some(mut rule) = self.state.storage.get(rule_id) {
             rule.enabled = true;
-            true
+            self.state.storage.update(rule)
         } else {
             false
         }
@@ -225,10 +344,9 @@ impl TriggerRuleEngine {
 
     /// 禁用一条规则。
     pub fn disable_rule(&self, rule_id: &str) -> bool {
-        let mut rules = self.rules.write().unwrap();
-        if let Some(rule) = rules.iter_mut().find(|r| r.id == rule_id) {
+        if let Some(mut rule) = self.state.storage.get(rule_id) {
             rule.enabled = false;
-            true
+            self.state.storage.update(rule)
         } else {
             false
         }
@@ -236,77 +354,91 @@ impl TriggerRuleEngine {
 
     /// 获取所有规则。
     pub fn list_rules(&self) -> Vec<TriggerRule> {
-        self.rules.read().unwrap().clone()
+        self.state.storage.list()
     }
 
     /// 获取指定 ID 的规则。
     pub fn get_rule(&self, rule_id: &str) -> Option<TriggerRule> {
-        self.rules
-            .read()
-            .unwrap()
-            .iter()
-            .find(|r| r.id == rule_id)
-            .cloned()
+        self.state.storage.get(rule_id)
     }
 
     /// 获取规则数量。
     pub fn rule_count(&self) -> usize {
-        self.rules.read().unwrap().len()
+        self.state.storage.count()
     }
 
     /// 列出已注册的 action 类型。
     pub fn list_action_types(&self) -> Vec<String> {
-        self.actions.read().unwrap().keys().cloned().collect()
+        self.state.actions.read().unwrap().keys().cloned().collect()
     }
 
     /// 检查引擎是否正在运行。
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.state.running.load(Ordering::Relaxed)
     }
 
     /// 启动触发规则引擎。
     ///
-    /// 订阅 EventBus 上的 `TriggerEvent` 类型事件，开始处理规则匹配。
+    /// 通过 EventBus 的 publish callback 机制监听所有已发布的事件，
+    /// 当事件的 `to_json()` 返回 JSON 数据时，自动匹配规则并执行动作。
     /// 如果引擎已经在运行，则不做任何操作。
-    ///
-    /// # Errors
-    ///
-    /// 如果 EventBus 订阅失败则返回错误。
     pub async fn start(&self) -> Result<()> {
-        if self.running.load(Ordering::Relaxed) {
+        if self.state.running.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        let sub = self
-            .bus
-            .subscribe_pattern::<TriggerEvent, _, _>("**", |_event: TriggerEvent| async {
-                Ok(())
-            })
-            .await?;
+        let state = self.state.clone();
+        self.bus.register_publish_callback(Arc::new(
+            move |event_name: &str, data: serde_json::Value| {
+                let state = state.clone();
+                let event_name = event_name.to_string();
+                tokio::spawn(async move {
+                    // Only process if engine is still running
+                    if !state.running.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ =
+                        TriggerRuleEngine::evaluate_rules(&state, &event_name, &data).await;
+                });
+            },
+        ));
 
-        *self.subscription.write().unwrap() = Some(sub);
-        self.running.store(true, Ordering::Relaxed);
+        self.state.running.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     /// 停止触发规则引擎。
+    ///
+    /// Sets the running flag to false. Note that already-spawned tasks from
+    /// publish callbacks may still complete — this is acceptable for now.
     pub fn stop(&self) {
-        if let Some(sub) = self.subscription.write().unwrap().take() {
-            sub.unsubscribe();
-        }
-        self.running.store(false, Ordering::Relaxed);
+        self.state.running.store(false, Ordering::Relaxed);
     }
 
     /// 处理一个事件，匹配规则并执行动作。
     ///
-    /// 此方法通常在引擎内部自动调用，也可以手动调用用于测试或自定义集成。
+    /// 此方法通常在引擎内部自动调用（通过 publish callback），
+    /// 也可以手动调用用于测试或自定义集成。
     pub async fn process_event(
         &self,
         event_name: &str,
         event_data: &serde_json::Value,
     ) -> Vec<Result<()>> {
-        let rules = self.rules.read().unwrap().clone();
-        let actions = self.actions.read().unwrap();
+        Self::evaluate_rules(&self.state, event_name, event_data).await
+    }
+
+    /// Internal method that evaluates rules against an event using shared state.
+    ///
+    /// This is called both by [`Self::process_event`] and by the publish callback.
+    async fn evaluate_rules(
+        state: &Arc<TriggerEngineState>,
+        event_name: &str,
+        event_data: &serde_json::Value,
+    ) -> Vec<Result<()>> {
+        // Clone both rules and actions to drop the RwLock guards before awaiting.
+        // This is required for `Send` safety when called from `tokio::spawn`.
+        let rules = state.storage.list();
+        let actions = state.actions.read().unwrap().clone();
 
         let mut results = Vec::new();
 
@@ -888,5 +1020,106 @@ mod tests {
         assert_eq!(deserialized.id, "rule-1");
         assert_eq!(deserialized.event_pattern, "user.*");
         assert!(deserialized.condition.is_some());
+    }
+
+    // ── start/stop tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_start_stop() {
+        let bus = EventBus::new();
+        let engine = TriggerRuleEngine::new(bus);
+
+        assert!(!engine.is_running());
+
+        engine.start().await.unwrap();
+        assert!(engine.is_running());
+
+        // Starting again is a no-op
+        engine.start().await.unwrap();
+        assert!(engine.is_running());
+
+        engine.stop();
+        assert!(!engine.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_process_event_works_regardless_of_running_state() {
+        // process_event is a direct API for manual/testing use and should work
+        // regardless of the running flag. The running flag only controls whether
+        // the publish callback spawns processing tasks.
+        let bus = EventBus::new();
+        let engine = TriggerRuleEngine::new(bus);
+
+        let executed: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+        let executed_clone = executed.clone();
+
+        engine.register_action("collect", move |ctx: TriggerContext| {
+            let executed_clone = executed_clone.clone();
+            async move {
+                executed_clone
+                    .write()
+                    .unwrap()
+                    .push(ctx.rule_id.clone());
+                Ok(())
+            }
+        });
+
+        engine.add_rule(make_rule("r1", "user.*", "collect", serde_json::json!({})));
+
+        // Engine was never started (running = false), but process_event still works
+        let results = engine
+            .process_event("user.created", &serde_json::json!({}))
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        let log = executed.read().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0], "r1");
+    }
+
+    // ── RuleStorage tests ───────────────────────────────────────
+
+    #[test]
+    fn test_in_memory_rule_storage_basic() {
+        let storage = InMemoryRuleStorage::new();
+
+        storage.add(make_rule("r1", "user.*", "log", serde_json::json!({})));
+        storage.add(make_rule("r2", "order.*", "notify", serde_json::json!({})));
+
+        assert_eq!(storage.count(), 2);
+
+        let rules = storage.list();
+        assert_eq!(rules.len(), 2);
+
+        assert!(storage.get("r1").is_some());
+        assert!(storage.get("nonexistent").is_none());
+
+        let removed = storage.remove("r1").unwrap();
+        assert_eq!(removed.id, "r1");
+        assert_eq!(storage.count(), 1);
+        assert!(storage.remove("nonexistent").is_none());
+
+        let mut updated = make_rule("r2", "order.**", "email", serde_json::json!({}));
+        updated.name = "Updated".to_string();
+        assert!(storage.update(updated));
+        assert_eq!(storage.get("r2").unwrap().name, "Updated");
+        assert!(!storage.update(make_rule("r99", "x", "y", serde_json::json!({}))));
+    }
+
+    #[test]
+    fn test_with_custom_storage() {
+        let storage: Arc<dyn RuleStorage> = Arc::new(InMemoryRuleStorage::new());
+        let bus = EventBus::new();
+        let engine = TriggerRuleEngine::with_storage(bus, storage.clone());
+
+        engine.add_rule(make_rule("r1", "user.*", "log", serde_json::json!({})));
+
+        // Verify through storage directly
+        assert_eq!(storage.count(), 1);
+        assert_eq!(storage.get("r1").unwrap().event_pattern, "user.*");
+
+        // Verify through engine
+        assert_eq!(engine.rule_count(), 1);
+        assert_eq!(engine.list_rules()[0].id, "r1");
     }
 }

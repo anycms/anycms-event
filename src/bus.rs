@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 
 use crate::error::{EventBusError, PublishErrorReason, Result};
 use crate::event::Event;
@@ -22,6 +24,10 @@ use crate::telemetry::Telemetry;
 /// so they can be sent through broadcast channels without serialization.
 type ErasedEvent = Arc<dyn Any + Send + Sync>;
 
+/// Callback invoked after an event is published, receiving the event name
+/// and its JSON representation. Used by observers like `TriggerRuleEngine`.
+type PublishCallback = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
 /// Wrapper used on the global dispatch channel.
 /// Carries the event name (used for pattern matching) alongside the type-erased payload.
 #[derive(Clone)]
@@ -30,8 +36,81 @@ struct GlobalEvent {
     payload: ErasedEvent,
 }
 
+// ── Retry & Dead Letter Types ──────────────────────────────────────
+
+/// 重试退避策略。
+#[derive(Clone, Debug)]
+pub enum RetryBackoff {
+    /// 固定间隔。
+    Fixed(Duration),
+    /// 指数退避（delay = base * 2^attempt，不超过 max）。
+    Exponential { base: Duration, max: Duration },
+}
+
+impl Default for RetryBackoff {
+    fn default() -> Self {
+        Self::Exponential {
+            base: Duration::from_millis(100),
+            max: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Handler 执行重试策略。
+#[derive(Clone, Debug)]
+pub struct RetryPolicy {
+    /// 最大重试次数（0 = 不重试，默认）。
+    pub max_retries: usize,
+    /// 退避策略。
+    pub backoff: RetryBackoff,
+    /// 每次执行超时时间。
+    pub timeout_per_attempt: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 0, // 默认不重试，保持向后兼容
+            backoff: RetryBackoff::default(),
+            timeout_per_attempt: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// 计算第 N 次重试前的等待时间。
+    pub fn delay_for_attempt(&self, attempt: usize) -> Duration {
+        match &self.backoff {
+            RetryBackoff::Fixed(d) => *d,
+            RetryBackoff::Exponential { base, max } => {
+                let exp = 2u32.saturating_pow(attempt.min(16) as u32);
+                base.saturating_mul(exp as u32).min(*max)
+            }
+        }
+    }
+}
+
+/// 死信处理器 — 当 Handler 重试耗尽后调用。
+pub trait DeadLetterHandler: Send + Sync + 'static {
+    /// 事件处理彻底失败时调用。
+    fn on_dead_letter(&self, event_name: &str, attempts: usize, error: &str);
+}
+
+/// 默认死信处理器 — 使用 tracing::error! 记录。
+pub struct LoggingDeadLetterHandler;
+
+impl DeadLetterHandler for LoggingDeadLetterHandler {
+    fn on_dead_letter(&self, event_name: &str, attempts: usize, error: &str) {
+        tracing::error!(
+            event = event_name,
+            attempts = attempts,
+            error = error,
+            "Event handler failed after all retries (dead letter)"
+        );
+    }
+}
+
 /// A subscription handle that allows unsubscribing or graceful shutdown.
-#[derive(Debug)]
 pub struct Subscription {
     /// The event name or pattern this subscription is bound to.
     pub event_name: String,
@@ -39,6 +118,18 @@ pub struct Subscription {
     pub id: usize,
     /// Abort handle for cancelling the subscriber task.
     abort_handle: AbortHandle,
+    /// Reference to inner state for task cleanup on unsubscribe.
+    inner: Arc<EventBusInner>,
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("event_name", &self.event_name)
+            .field("id", &self.id)
+            .field("is_finished", &self.abort_handle.is_finished())
+            .finish()
+    }
 }
 
 impl Subscription {
@@ -48,6 +139,7 @@ impl Subscription {
     /// This is idempotent — calling it multiple times has no effect.
     pub fn unsubscribe(&self) {
         self.abort_handle.abort();
+        self.inner.tasks.write().unwrap().remove(&self.id);
     }
 
     /// Check if this subscription is still active.
@@ -118,12 +210,24 @@ struct EventBusInner {
     registry: Arc<EventRegistry>,
     /// 执行日志，用于查询事件发布和 Handler 执行的历史记录。
     execution_log: Option<Arc<ExecutionLog>>,
+    /// Publish callbacks invoked after each event is published.
+    /// Used by observers like `TriggerRuleEngine` that need to see all events.
+    publish_callbacks: RwLock<Vec<PublishCallback>>,
+    /// Track spawned subscriber tasks for graceful shutdown.
+    tasks: RwLock<HashMap<usize, JoinHandle<()>>>,
+    /// 默认重试策略。
+    retry_policy: RetryPolicy,
+    /// 死信处理器。
+    dead_letter: Option<Arc<dyn DeadLetterHandler>>,
 }
 
 impl EventBus {
     /// Create a new event bus with the default channel capacity (1024).
     pub fn new() -> Self {
-        Self::from_builder(1024, None, Arc::new(EventRegistry::new()), None)
+        Self::from_builder(
+            1024, None, Arc::new(EventRegistry::new()), None,
+            RetryPolicy::default(), None,
+        )
     }
 
     /// Create a new event bus with the specified broadcast channel capacity.
@@ -131,7 +235,10 @@ impl EventBus {
     /// The capacity controls how many messages can be buffered before slow
     /// subscribers start being lagged (dropping old messages).
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::from_builder(capacity, None, Arc::new(EventRegistry::new()), None)
+        Self::from_builder(
+            capacity, None, Arc::new(EventRegistry::new()), None,
+            RetryPolicy::default(), None,
+        )
     }
 
     /// 从构建器参数创建 EventBus（内部方法）。
@@ -140,6 +247,8 @@ impl EventBus {
         telemetry: Option<Arc<dyn Telemetry>>,
         registry: Arc<EventRegistry>,
         execution_log: Option<Arc<ExecutionLog>>,
+        retry_policy: RetryPolicy,
+        dead_letter: Option<Arc<dyn DeadLetterHandler>>,
     ) -> Self {
         let (global_tx, _) = broadcast::channel(capacity);
         Self {
@@ -152,6 +261,10 @@ impl EventBus {
                 telemetry,
                 registry,
                 execution_log,
+                publish_callbacks: RwLock::new(Vec::new()),
+                tasks: RwLock::new(HashMap::new()),
+                retry_policy,
+                dead_letter,
             }),
         }
     }
@@ -173,6 +286,17 @@ impl EventBus {
     /// 执行日志记录了事件发布和 Handler 执行的历史。
     pub fn execution_log(&self) -> Option<&Arc<ExecutionLog>> {
         self.inner.execution_log.as_ref()
+    }
+
+    /// Register a publish callback that is invoked after every event is published.
+    ///
+    /// The callback receives the event name and its JSON representation.
+    /// Events that return `None` from [`Event::to_json`] will not trigger callbacks.
+    ///
+    /// This is the primary mechanism for `TriggerRuleEngine` to observe all events
+    /// without needing a typed subscription.
+    pub fn register_publish_callback(&self, callback: PublishCallback) {
+        self.inner.publish_callbacks.write().unwrap().push(callback);
     }
 
     /// Get or create a broadcast channel for the given event type.
@@ -222,6 +346,9 @@ impl EventBus {
             self.inner.registry.register_simple(E::event_name(), E::topic());
         }
         self.inner.registry.increment_publish_count(E::event_name());
+
+        // Extract JSON for publish callbacks (before moving event)
+        let event_json = event.to_json();
 
         // Fast path: check if channel exists with read lock
         let sender = {
@@ -294,6 +421,14 @@ impl EventBus {
             let _ = self.inner.global_channel.send(global_event);
         }
 
+        // Notify publish callbacks (for trigger engine etc.)
+        if let Some(json) = event_json {
+            let callbacks = self.inner.publish_callbacks.read().unwrap();
+            for cb in callbacks.iter() {
+                cb(E::event_name(), json.clone());
+            }
+        }
+
         Ok(())
     }
 
@@ -302,6 +437,9 @@ impl EventBus {
     /// The handler is spawned as a background tokio task that listens for
     /// events on the broadcast channel. If the handler falls behind,
     /// lagged messages are logged as warnings but the subscriber continues.
+    ///
+    /// Uses the bus-level [`RetryPolicy`] (default: no retry).
+    /// For custom retry, use [`EventBus::subscribe_with_retry`].
     ///
     /// # Type Parameters
     ///
@@ -319,6 +457,34 @@ impl EventBus {
         F: Fn(E) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
+        self.subscribe_internal(handler, self.inner.retry_policy.clone()).await
+    }
+
+    /// Subscribe with a custom retry policy (overrides the bus default).
+    pub async fn subscribe_with_retry<E, F, Fut>(
+        &self,
+        handler: F,
+        retry_policy: RetryPolicy,
+    ) -> Result<Subscription>
+    where
+        E: Event,
+        F: Fn(E) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        self.subscribe_internal(handler, retry_policy).await
+    }
+
+    /// Internal subscribe implementation with configurable retry.
+    async fn subscribe_internal<E, F, Fut>(
+        &self,
+        handler: F,
+        retry_policy: RetryPolicy,
+    ) -> Result<Subscription>
+    where
+        E: Event,
+        F: Fn(E) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
         let sender = self.get_or_create_channel::<E>();
         let mut rx = sender.subscribe();
 
@@ -331,9 +497,10 @@ impl EventBus {
 
         // Clone telemetry Arc for use inside the spawned task
         let telemetry = self.inner.telemetry.clone();
+        let dead_letter = self.inner.dead_letter.clone();
 
         let handler_event_name = event_name.clone();
-        let handle = tokio::spawn(async move {
+        let handle: JoinHandle<()> = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(payload) => {
@@ -344,18 +511,71 @@ impl EventBus {
                                     tel.on_handler_start(&handler_event_name, id);
                                 }
                                 let handler_start = std::time::Instant::now();
-                                let result = handler(event.clone()).await;
-                                let handler_elapsed = handler_start.elapsed();
-                                if let Err(ref e) = result {
-                                    tracing::error!(
-                                        event = %handler_event_name,
-                                        error = %e,
-                                        "Handler error"
-                                    );
+
+                                // Retry loop
+                                let mut last_error_str = None;
+                                let mut success = false;
+                                for attempt in 0..=retry_policy.max_retries {
+                                    if attempt > 0 {
+                                        let delay = retry_policy.delay_for_attempt(attempt - 1);
+                                        tracing::debug!(
+                                            event = %handler_event_name,
+                                            attempt = attempt + 1,
+                                            delay_ms = delay.as_millis(),
+                                            "Retrying handler"
+                                        );
+                                        tokio::time::sleep(delay).await;
+                                    }
+
+                                    match tokio::time::timeout(
+                                        retry_policy.timeout_per_attempt,
+                                        handler(event.clone()),
+                                    ).await {
+                                        Ok(Ok(())) => {
+                                            success = true;
+                                            break;
+                                        }
+                                        Ok(Err(e)) => {
+                                            last_error_str = Some(e.to_string());
+                                            tracing::warn!(
+                                                event = %handler_event_name,
+                                                attempt = attempt + 1,
+                                                max_retries = retry_policy.max_retries,
+                                                error = %e,
+                                                "Handler failed"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            last_error_str = Some("Handler timeout".to_string());
+                                            tracing::warn!(
+                                                event = %handler_event_name,
+                                                attempt = attempt + 1,
+                                                "Handler timed out"
+                                            );
+                                        }
+                                    }
                                 }
+
+                                let handler_elapsed = handler_start.elapsed();
+
+                                // Dead letter if all retries exhausted
+                                if !success {
+                                    if let Some(ref dl) = dead_letter {
+                                        dl.on_dead_letter(
+                                            &handler_event_name,
+                                            retry_policy.max_retries + 1,
+                                            last_error_str.as_deref().unwrap_or("unknown"),
+                                        );
+                                    }
+                                }
+
                                 // Telemetry: handler complete
                                 if let Some(ref tel) = telemetry {
-                                    let err_str = result.as_ref().err().map(|e| e.to_string());
+                                    let err_str = if success {
+                                        None
+                                    } else {
+                                        last_error_str
+                                    };
                                     tel.on_handler_complete(
                                         &handler_event_name,
                                         id,
@@ -396,6 +616,12 @@ impl EventBus {
 
         let abort_handle = handle.abort_handle();
 
+        // Store JoinHandle for graceful shutdown
+        {
+            let mut tasks = self.inner.tasks.write().unwrap();
+            tasks.insert(id, handle);
+        }
+
         // Telemetry: subscriber registered
         if let Some(ref tel) = self.inner.telemetry {
             tel.on_subscribe(&event_name, id);
@@ -405,6 +631,7 @@ impl EventBus {
             event_name,
             id,
             abort_handle,
+            inner: self.inner.clone(),
         })
     }
 
@@ -418,10 +645,43 @@ impl EventBus {
     /// Pattern subscribers listen on the global channel and filter events
     /// using [`crate::topic::matches`]. This allows a single subscriber to
     /// receive events of different types that share a topic namespace.
+    ///
+    /// Uses the bus-level [`RetryPolicy`] (default: no retry).
+    /// For custom retry, use [`EventBus::subscribe_pattern_with_retry`].
     pub async fn subscribe_pattern<E, F, Fut>(
         &self,
         pattern: &str,
         handler: F,
+    ) -> Result<Subscription>
+    where
+        E: Event,
+        F: Fn(E) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        self.subscribe_pattern_internal(pattern, handler, self.inner.retry_policy.clone()).await
+    }
+
+    /// Subscribe to a pattern with a custom retry policy.
+    pub async fn subscribe_pattern_with_retry<E, F, Fut>(
+        &self,
+        pattern: &str,
+        handler: F,
+        retry_policy: RetryPolicy,
+    ) -> Result<Subscription>
+    where
+        E: Event,
+        F: Fn(E) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        self.subscribe_pattern_internal(pattern, handler, retry_policy).await
+    }
+
+    /// Internal pattern subscribe implementation with configurable retry.
+    async fn subscribe_pattern_internal<E, F, Fut>(
+        &self,
+        pattern: &str,
+        handler: F,
+        retry_policy: RetryPolicy,
     ) -> Result<Subscription>
     where
         E: Event,
@@ -445,8 +705,9 @@ impl EventBus {
 
         // Clone telemetry Arc for use inside the spawned task
         let telemetry = self.inner.telemetry.clone();
+        let dead_letter = self.inner.dead_letter.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle: JoinHandle<()> = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(global_event) => {
@@ -461,19 +722,61 @@ impl EventBus {
                                     tel.on_handler_start(&handler_event_name, id);
                                 }
                                 let handler_start = std::time::Instant::now();
-                                let result = handler(event.clone()).await;
-                                let handler_elapsed = handler_start.elapsed();
-                                if let Err(ref e) = result {
-                                    tracing::error!(
-                                        event = %handler_event_name,
-                                        pattern = %pattern_owned,
-                                        error = %e,
-                                        "Pattern handler error"
-                                    );
+
+                                // Retry loop
+                                let mut last_error_str = None;
+                                let mut success = false;
+                                for attempt in 0..=retry_policy.max_retries {
+                                    if attempt > 0 {
+                                        let delay = retry_policy.delay_for_attempt(attempt - 1);
+                                        tracing::debug!(
+                                            event = %handler_event_name,
+                                            pattern = %pattern_owned,
+                                            attempt = attempt + 1,
+                                            "Retrying pattern handler"
+                                        );
+                                        tokio::time::sleep(delay).await;
+                                    }
+
+                                    match tokio::time::timeout(
+                                        retry_policy.timeout_per_attempt,
+                                        handler(event.clone()),
+                                    ).await {
+                                        Ok(Ok(())) => {
+                                            success = true;
+                                            break;
+                                        }
+                                        Ok(Err(e)) => {
+                                            last_error_str = Some(e.to_string());
+                                            tracing::warn!(
+                                                event = %handler_event_name,
+                                                pattern = %pattern_owned,
+                                                attempt = attempt + 1,
+                                                error = %e,
+                                                "Pattern handler failed"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            last_error_str = Some("Handler timeout".to_string());
+                                        }
+                                    }
                                 }
+
+                                let handler_elapsed = handler_start.elapsed();
+
+                                if !success {
+                                    if let Some(ref dl) = dead_letter {
+                                        dl.on_dead_letter(
+                                            &handler_event_name,
+                                            retry_policy.max_retries + 1,
+                                            last_error_str.as_deref().unwrap_or("unknown"),
+                                        );
+                                    }
+                                }
+
                                 // Telemetry: handler complete
                                 if let Some(ref tel) = telemetry {
-                                    let err_str = result.as_ref().err().map(|e| e.to_string());
+                                    let err_str = if success { None } else { last_error_str };
                                     tel.on_handler_complete(
                                         &handler_event_name,
                                         id,
@@ -485,7 +788,6 @@ impl EventBus {
                             None => {
                                 // Event matched the pattern name but is a different type.
                                 // This is expected when multiple event types share a topic.
-                                // Just skip it — another subscriber with the correct type will handle it.
                             }
                         }
                     }
@@ -513,6 +815,12 @@ impl EventBus {
 
         let abort_handle = handle.abort_handle();
 
+        // Store JoinHandle for graceful shutdown
+        {
+            let mut tasks = self.inner.tasks.write().unwrap();
+            tasks.insert(id, handle);
+        }
+
         // Telemetry: subscriber registered
         if let Some(ref tel) = self.inner.telemetry {
             tel.on_subscribe(&event_name, id);
@@ -522,15 +830,58 @@ impl EventBus {
             event_name,
             id,
             abort_handle,
+            inner: self.inner.clone(),
         })
     }
 
-    /// Shut down the event bus by clearing all channels.
+    /// Shut down the event bus by aborting all subscriber tasks and clearing channels.
     ///
-    /// All active subscriber tasks will receive `Closed` errors and exit.
-    /// This is useful for graceful shutdown during application termination.
+    /// All active subscriber tasks are immediately aborted. This is useful
+    /// for a fast shutdown during application termination.
     pub fn shutdown(&self) {
+        // Abort all subscriber tasks
+        let tasks: Vec<(usize, JoinHandle<()>)> = {
+            let mut tasks_lock = self.inner.tasks.write().unwrap();
+            std::mem::take(&mut *tasks_lock).into_iter().collect()
+        };
+        for (_, handle) in tasks {
+            handle.abort();
+        }
+        // Clear per-event channels so any remaining receivers get Closed
         self.inner.channels.write().unwrap().clear();
+    }
+
+    /// Gracefully shut down the event bus, waiting for subscriber tasks to complete.
+    ///
+    /// Clears channels first so no new events arrive, then waits for all
+    /// subscriber tasks to finish. If the timeout elapses before all tasks
+    /// complete, returns the number of tasks that may still be running.
+    ///
+    /// Returns `0` on success (all tasks completed within the timeout).
+    pub async fn shutdown_graceful(&self, timeout: std::time::Duration) -> usize {
+        // Clear channels first so no new events arrive
+        self.inner.channels.write().unwrap().clear();
+
+        // Collect all task handles
+        let tasks: Vec<(usize, JoinHandle<()>)> = {
+            let mut tasks_lock = self.inner.tasks.write().unwrap();
+            std::mem::take(&mut *tasks_lock).into_iter().collect()
+        };
+
+        let total = tasks.len();
+        let result = tokio::time::timeout(timeout, async {
+            for (_, handle) in tasks {
+                let _ = handle.await;
+            }
+        })
+        .await;
+
+        if result.is_ok() {
+            0
+        } else {
+            // Timeout — some tasks may still be running
+            total
+        }
     }
 }
 

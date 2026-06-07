@@ -399,3 +399,222 @@ async fn test_subscription_unsubscribe() {
 
     assert_eq!(counter.load(Ordering::SeqCst), 1); // Still 1, second event was not received
 }
+
+// ── Retry & Dead Letter Tests ──────────────────────────────────────
+
+#[tokio::test]
+async fn test_handler_retry_success() {
+    use std::time::Duration;
+
+    let bus = EventBus::builder()
+        .retry_policy(RetryPolicy {
+            max_retries: 3,
+            backoff: RetryBackoff::Fixed(Duration::from_millis(1)),
+            timeout_per_attempt: Duration::from_secs(1),
+        })
+        .build();
+
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let attempt_clone = attempt_count.clone();
+
+    bus.subscribe(move |_event: UserCreated| {
+        let count = attempt_clone.clone();
+        async move {
+            let n = count.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                // Fail first 2 times
+                return Err(EventBusError::HandlerError {
+                    event_name: "user.created".to_string(),
+                    message: "temporary failure".to_string(),
+                });
+            }
+            Ok(())
+        }
+    })
+    .await
+    .unwrap();
+
+    bus.publish(UserCreated {
+        user_id: 1,
+        username: "test".into(),
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Should have been called 3 times (2 failures + 1 success)
+    assert!(attempt_count.load(Ordering::SeqCst) >= 3);
+}
+
+#[tokio::test]
+async fn test_dead_letter_handler_called() {
+    use std::time::Duration;
+
+    let dead_letter_count = Arc::new(AtomicUsize::new(0));
+    let dl_clone = dead_letter_count.clone();
+
+    struct CountingDeadLetter {
+        count: Arc<AtomicUsize>,
+    }
+    impl DeadLetterHandler for CountingDeadLetter {
+        fn on_dead_letter(&self, _event_name: &str, _attempts: usize, _error: &str) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let bus = EventBus::builder()
+        .retry_policy(RetryPolicy {
+            max_retries: 2,
+            backoff: RetryBackoff::Fixed(Duration::from_millis(1)),
+            timeout_per_attempt: Duration::from_secs(1),
+        })
+        .dead_letter_handler(CountingDeadLetter { count: dl_clone })
+        .build();
+
+    bus.subscribe(move |_event: UserCreated| {
+        async move {
+            Err(EventBusError::HandlerError {
+                event_name: "user.created".to_string(),
+                message: "always fails".to_string(),
+            })
+        }
+    })
+    .await
+    .unwrap();
+
+    bus.publish(UserCreated {
+        user_id: 1,
+        username: "test".into(),
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(dead_letter_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_no_retry_by_default() {
+    use std::time::Duration;
+
+    let bus = EventBus::new(); // Default: max_retries = 0
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let attempt_clone = attempt_count.clone();
+
+    bus.subscribe(move |_event: UserCreated| {
+        let count = attempt_clone.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(EventBusError::HandlerError {
+                event_name: "user.created".to_string(),
+                message: "fail".to_string(),
+            })
+        }
+    })
+    .await
+    .unwrap();
+
+    bus.publish(UserCreated {
+        user_id: 1,
+        username: "test".into(),
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Should only be called once (no retry)
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_subscribe_with_retry_custom_policy() {
+    use std::time::Duration;
+
+    let bus = EventBus::new(); // Default: no retry
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let attempt_clone = attempt_count.clone();
+
+    // Override retry policy per-subscriber
+    bus.subscribe_with_retry(
+        move |_event: UserCreated| {
+            let count = attempt_clone.clone();
+            async move {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(EventBusError::HandlerError {
+                        event_name: "user.created".to_string(),
+                        message: "first attempt fails".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        },
+        RetryPolicy {
+            max_retries: 1,
+            backoff: RetryBackoff::Fixed(Duration::from_millis(1)),
+            timeout_per_attempt: Duration::from_secs(1),
+        },
+    )
+    .await
+    .unwrap();
+
+    bus.publish(UserCreated {
+        user_id: 1,
+        username: "test".into(),
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Should be called twice (1 fail + 1 success via retry)
+    assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_subscribe_pattern_with_retry() {
+    use std::time::Duration;
+
+    let bus = EventBus::builder()
+        .retry_policy(RetryPolicy {
+            max_retries: 1,
+            backoff: RetryBackoff::Fixed(Duration::from_millis(1)),
+            timeout_per_attempt: Duration::from_secs(1),
+        })
+        .build();
+
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let attempt_clone = attempt_count.clone();
+
+    bus.subscribe_pattern("user.*", move |_event: UserCreated| {
+        let count = attempt_clone.clone();
+        async move {
+            let n = count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(EventBusError::HandlerError {
+                    event_name: "user.created".to_string(),
+                    message: "fail first".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    bus.publish(UserCreated {
+        user_id: 1,
+        username: "test".into(),
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(attempt_count.load(Ordering::SeqCst) >= 2);
+}

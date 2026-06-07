@@ -549,3 +549,106 @@ impl Clone for BridgedEventBus {
         }
     }
 }
+
+// ── Transport trait implementation ────────────────────────────────
+
+impl anycms_event::transport::Transport for RedisTransport {
+    fn publish(
+        &self,
+        event_name: &str,
+        payload: &str,
+    ) -> anycms_event::transport::TransportFuture<'_> {
+        // Convert to owned strings so the async block does not capture
+        // references with mismatched lifetimes.
+        let event_name = event_name.to_string();
+        let payload = payload.to_string();
+        Box::pin(async move {
+            self.publish(&event_name, &payload)
+                .await
+                .map_err(|e| anycms_event::transport::TransportError::Publish(e.to_string()))
+        })
+    }
+
+    fn clone_box(&self) -> Box<dyn anycms_event::transport::Transport> {
+        Box::new(self.clone())
+    }
+}
+
+impl anycms_event::transport::ForwarderHandle for ForwarderHandle {
+    fn stop(&self) {
+        // Calls the inherent ForwarderHandle::stop
+        self.handle.abort();
+    }
+
+    fn is_finished(&self) -> bool {
+        // Calls the inherent ForwarderHandle::is_finished
+        self.handle.is_finished()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redis_message_serialization() {
+        let msg = RedisMessage {
+            source_id: "pid:123".to_string(),
+            payload: r#"{"user_id":1,"name":"alice"}"#.to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: RedisMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_id, "pid:123");
+        assert_eq!(parsed.payload, r#"{"user_id":1,"name":"alice"}"#);
+    }
+
+    #[test]
+    fn test_redis_message_echo_prevention() {
+        let my_source = "pid:1:1";
+        let other_source = "pid:2:1";
+
+        let msg_mine = RedisMessage {
+            source_id: my_source.to_string(),
+            payload: "{}".to_string(),
+        };
+        let msg_other = RedisMessage {
+            source_id: other_source.to_string(),
+            payload: "{}".to_string(),
+        };
+
+        // Echo prevention: skip if source_id matches
+        assert_eq!(msg_mine.source_id, my_source);
+        assert_ne!(msg_other.source_id, my_source);
+    }
+
+    #[test]
+    fn test_source_id_uniqueness() {
+        let id1 = generate_source_id();
+        let id2 = generate_source_id();
+        assert_ne!(id1, id2);
+        assert!(id1.contains(':'));
+    }
+
+    #[test]
+    fn test_source_id_format() {
+        let id = generate_source_id();
+        let parts: Vec<&str> = id.split(':').collect();
+        assert_eq!(parts.len(), 2);
+        // First part should be a number (PID)
+        assert!(parts[0].parse::<u32>().is_ok());
+        // Second part should be a counter
+        assert!(parts[1].parse::<u64>().is_ok());
+    }
+
+    /// Compile-time check that RedisTransport satisfies the Transport trait bound.
+    fn _assert_transport_trait_bound() {
+        fn check_transport<T: anycms_event::transport::Transport>() {}
+        check_transport::<RedisTransport>();
+    }
+
+    /// Compile-time check that ForwarderHandle satisfies the trait ForwarderHandle bound.
+    fn _assert_forwarder_handle_trait_bound() {
+        fn check<T: anycms_event::transport::ForwarderHandle>() {}
+        check::<ForwarderHandle>();
+    }
+}
