@@ -1,0 +1,11 @@
+[package]
+name = "anycms-event-axum"
+description = "Axum integration for anycms-event"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+anycms-event.workspace = true
+axum = "0.8"

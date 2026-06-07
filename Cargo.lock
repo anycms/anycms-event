@@ -222,13 +222,33 @@ dependencies = [
  "actix-web",
  "anycms-event-derive",
  "anycms-event-redis",
+ "anycms-event-sse",
  "axum",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-stream",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "anycms-event-actix"
+version = "0.1.2"
+dependencies = [
+ "actix-web",
+ "anycms-event",
+]
+
+[[package]]
+name = "anycms-event-axum"
+version = "0.1.2"
+dependencies = [
+ "anycms-event",
+ "axum",
 ]
 
 [[package]]
@@ -247,6 +267,21 @@ dependencies = [
  "anycms-event",
  "futures-util",
  "redis",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "anycms-event-sse"
+version = "0.1.2"
+dependencies = [
+ "actix-web",
+ "anycms-event",
+ "axum",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror",
@@ -1695,6 +1730,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1721,6 +1767,20 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
+dependencies = [
+ "bitflags",
+ "bytes",
+ "http 1.4.1",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]

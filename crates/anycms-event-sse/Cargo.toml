@@ -1,0 +1,29 @@
+[package]
+name = "anycms-event-sse"
+description = "Server-Sent Events bridge for anycms-event"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+anycms-event.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+axum = ["dep:axum"]
+actix = ["dep:actix-web"]
+
+[dependencies.axum]
+version = "0.8"
+optional = true
+
+[dependencies.actix-web]
+version = "4"
+optional = true

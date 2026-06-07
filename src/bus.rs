@@ -14,6 +14,7 @@ use tokio::task::AbortHandle;
 
 use crate::error::{EventBusError, PublishErrorReason, Result};
 use crate::event::Event;
+use crate::telemetry::Telemetry;
 
 /// Type-erased event payload. Events are wrapped in `Arc<dyn Any + Send + Sync>`
 /// so they can be sent through broadcast channels without serialization.
@@ -109,12 +110,14 @@ struct EventBusInner {
     next_sub_id: AtomicUsize,
     /// Capacity for new broadcast channels.
     capacity: usize,
+    /// 可插拔的遥测层，用于监控发布/订阅生命周期。
+    telemetry: Option<Arc<dyn Telemetry>>,
 }
 
 impl EventBus {
     /// Create a new event bus with the default channel capacity (1024).
     pub fn new() -> Self {
-        Self::with_capacity(1024)
+        Self::from_builder(1024, None)
     }
 
     /// Create a new event bus with the specified broadcast channel capacity.
@@ -122,6 +125,11 @@ impl EventBus {
     /// The capacity controls how many messages can be buffered before slow
     /// subscribers start being lagged (dropping old messages).
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::from_builder(capacity, None)
+    }
+
+    /// 从构建器参数创建 EventBus（内部方法）。
+    pub(crate) fn from_builder(capacity: usize, telemetry: Option<Arc<dyn Telemetry>>) -> Self {
         let (global_tx, _) = broadcast::channel(capacity);
         Self {
             inner: Arc::new(EventBusInner {
@@ -130,8 +138,14 @@ impl EventBus {
                 topic_patterns: RwLock::new(HashMap::new()),
                 next_sub_id: AtomicUsize::new(0),
                 capacity,
+                telemetry,
             }),
         }
+    }
+
+    /// 返回一个 [`EventBusBuilder`] 用于配置 EventBus。
+    pub fn builder() -> crate::builder::EventBusBuilder {
+        crate::builder::EventBusBuilder::new()
     }
 
     /// Get or create a broadcast channel for the given event type.
@@ -168,6 +182,8 @@ impl EventBus {
     /// Returns [`EventBusError::PublishFailed`] if the channel returns an
     /// unexpected error.
     pub async fn publish<E: Event>(&self, event: E) -> Result<()> {
+        let start = std::time::Instant::now();
+
         // Fast path: check if channel exists with read lock
         let sender = {
             let channels = self.inner.channels.read().unwrap();
@@ -201,6 +217,11 @@ impl EventBus {
             let payload: ErasedEvent = Arc::new(event.clone());
             let receiver_count = sender.receiver_count();
 
+            // Telemetry: publish started
+            if let Some(ref tel) = self.inner.telemetry {
+                tel.on_publish(E::event_name(), receiver_count);
+            }
+
             sender
                 .send(payload)
                 .map_err(|e| EventBusError::PublishFailed {
@@ -213,6 +234,11 @@ impl EventBus {
                 receivers = receiver_count,
                 "Event published"
             );
+
+            // Telemetry: publish complete
+            if let Some(ref tel) = self.inner.telemetry {
+                tel.on_publish_complete(E::event_name(), start.elapsed());
+            }
 
             // Also publish to the global channel for pattern subscribers
             let global_event = GlobalEvent {
@@ -260,6 +286,9 @@ impl EventBus {
         let event_name = E::event_name().to_string();
         let id = self.inner.next_sub_id.fetch_add(1, Ordering::Relaxed);
 
+        // Clone telemetry Arc for use inside the spawned task
+        let telemetry = self.inner.telemetry.clone();
+
         let handler_event_name = event_name.clone();
         let handle = tokio::spawn(async move {
             loop {
@@ -267,11 +296,28 @@ impl EventBus {
                     Ok(payload) => {
                         match payload.downcast_ref::<E>() {
                             Some(event) => {
-                                if let Err(e) = handler(event.clone()).await {
+                                // Telemetry: handler start
+                                if let Some(ref tel) = telemetry {
+                                    tel.on_handler_start(&handler_event_name, id);
+                                }
+                                let handler_start = std::time::Instant::now();
+                                let result = handler(event.clone()).await;
+                                let handler_elapsed = handler_start.elapsed();
+                                if let Err(ref e) = result {
                                     tracing::error!(
                                         event = %handler_event_name,
                                         error = %e,
                                         "Handler error"
+                                    );
+                                }
+                                // Telemetry: handler complete
+                                if let Some(ref tel) = telemetry {
+                                    let err_str = result.as_ref().err().map(|e| e.to_string());
+                                    tel.on_handler_complete(
+                                        &handler_event_name,
+                                        id,
+                                        handler_elapsed,
+                                        err_str.as_deref(),
                                     );
                                 }
                             }
@@ -289,6 +335,10 @@ impl EventBus {
                             lagged = n,
                             "Subscriber lagged behind"
                         );
+                        // Telemetry: handler lagged
+                        if let Some(ref tel) = telemetry {
+                            tel.on_handler_lagged(&handler_event_name, id, n as usize);
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::debug!(
@@ -302,6 +352,11 @@ impl EventBus {
         });
 
         let abort_handle = handle.abort_handle();
+
+        // Telemetry: subscriber registered
+        if let Some(ref tel) = self.inner.telemetry {
+            tel.on_subscribe(&event_name, id);
+        }
 
         Ok(Subscription {
             event_name,
@@ -345,6 +400,9 @@ impl EventBus {
         let pattern_owned = pattern.to_string();
         let handler_event_name = event_name.clone();
 
+        // Clone telemetry Arc for use inside the spawned task
+        let telemetry = self.inner.telemetry.clone();
+
         let handle = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -355,12 +413,29 @@ impl EventBus {
                         }
                         match global_event.payload.downcast_ref::<E>() {
                             Some(event) => {
-                                if let Err(e) = handler(event.clone()).await {
+                                // Telemetry: handler start
+                                if let Some(ref tel) = telemetry {
+                                    tel.on_handler_start(&handler_event_name, id);
+                                }
+                                let handler_start = std::time::Instant::now();
+                                let result = handler(event.clone()).await;
+                                let handler_elapsed = handler_start.elapsed();
+                                if let Err(ref e) = result {
                                     tracing::error!(
                                         event = %handler_event_name,
                                         pattern = %pattern_owned,
                                         error = %e,
                                         "Pattern handler error"
+                                    );
+                                }
+                                // Telemetry: handler complete
+                                if let Some(ref tel) = telemetry {
+                                    let err_str = result.as_ref().err().map(|e| e.to_string());
+                                    tel.on_handler_complete(
+                                        &handler_event_name,
+                                        id,
+                                        handler_elapsed,
+                                        err_str.as_deref(),
                                     );
                                 }
                             }
@@ -377,6 +452,10 @@ impl EventBus {
                             lagged = n,
                             "Pattern subscriber lagged behind"
                         );
+                        // Telemetry: handler lagged
+                        if let Some(ref tel) = telemetry {
+                            tel.on_handler_lagged(&handler_event_name, id, n as usize);
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::debug!(
@@ -390,6 +469,11 @@ impl EventBus {
         });
 
         let abort_handle = handle.abort_handle();
+
+        // Telemetry: subscriber registered
+        if let Some(ref tel) = self.inner.telemetry {
+            tel.on_subscribe(&event_name, id);
+        }
 
         Ok(Subscription {
             event_name,

@@ -8,3 +8,4 @@ pub use crate::error::{EventBusError, PublishErrorReason, Result};
 pub use crate::event::Event;
 pub use crate::bus::{EventBus, Subscription};
 pub use crate::topic;
+pub use crate::telemetry::Telemetry;

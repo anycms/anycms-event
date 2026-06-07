@@ -3,6 +3,9 @@ members = [
     ".",
     "crates/anycms-event-derive",
     "crates/anycms-event-redis",
+    "crates/anycms-event-axum",
+    "crates/anycms-event-actix",
+    "crates/anycms-event-sse",
 ]
 resolver = "3"
 
@@ -43,6 +46,14 @@ anycms-event-derive.workspace = true
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
 anycms-event-redis = { path = "crates/anycms-event-redis" }
+anycms-event-sse = { path = "crates/anycms-event-sse" }
 actix-web = "4"
 axum = "0.8"
+futures-util = "0.3"
+tokio-stream = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+[features]
+default = []
+testing = ["tokio/time"]

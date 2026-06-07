@@ -34,6 +34,8 @@ pub mod error;
 pub mod event;
 pub mod bus;
 pub mod topic;
+pub mod telemetry;
+pub mod builder;
 
 pub mod prelude;
 
@@ -41,6 +43,9 @@ pub mod prelude;
 pub use error::{EventBusError, Result};
 pub use event::Event;
 pub use bus::EventBus;
+
+#[cfg(feature = "testing")]
+pub mod testing;
 
 // Re-export proc macros from derive crate
 pub use anycms_event_derive::{Event, event_bus};
