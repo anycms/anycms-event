@@ -36,6 +36,9 @@ pub mod bus;
 pub mod topic;
 pub mod telemetry;
 pub mod builder;
+pub mod registry;
+pub mod execution_log;
+pub mod trigger;
 
 pub mod prelude;
 

@@ -13,6 +13,9 @@ A type-safe, async event bus system for AnyCMS, built on tokio broadcast channel
 - **`event_bus!` Macro** — 一键定义事件结构体 + topic 分组 + 类型化总线
 - **Wildcard Topics** — 支持 `*`（单段匹配）和 `**`（多段匹配）通配符
 - **Telemetry** — 可插拔的遥测中间件，内置 tracing 和自定义实现
+- **Event Registry** — 事件注册表，支持事件发现、查询和元数据管理
+- **Execution Log** — 执行日志，追踪事件发布和 Handler 执行历史
+- **Trigger Rule Engine** — 触发规则引擎，动态配置事件到动作的映射
 - **Testing Utilities** — `EventCollector` 消除测试中的 `sleep()` 等待
 - **SSE Streaming** — 通过 `anycms-event-sse` 将事件实时推送到前端
 - **Redis Transport** — 通过 `anycms-event-redis` 实现跨进程事件传递
@@ -151,19 +154,24 @@ pub trait Event: Clone + Send + Sync + 'static {
 | 方法 | 说明 |
 |------|------|
 | `EventBus::new()` | 创建默认容量（1024）的事件总线 |
-| `EventBus::builder()` | 使用 Builder 模式创建，支持配置容量和遥测 |
+| `EventBus::builder()` | 使用 Builder 模式创建，支持配置容量、遥测、注册表和执行日志 |
 | `bus.publish(event).await` | 发布事件（无订阅者时为空操作） |
 | `bus.subscribe(handler).await` | 订阅特定事件类型，handler 在独立 tokio task 中运行 |
 | `bus.subscribe_pattern(pattern, handler).await` | 使用通配符订阅，支持 `*` 和 `**` |
+| `bus.registry()` | 获取事件注册表引用 |
+| `bus.execution_log()` | 获取执行日志引用（如果已配置） |
 
 ### Builder 模式
 
 ```rust
 use anycms_event::telemetry::TracingTelemetry;
+use anycms_event::execution_log::{ExecutionLog, ExecutionLogTelemetry};
+use std::sync::Arc;
 
 let bus = EventBus::builder()
     .capacity(2048)
     .telemetry(TracingTelemetry)
+    .execution_log(Arc::new(ExecutionLog::in_memory()))
     .build();
 ```
 
@@ -174,6 +182,152 @@ let bus = EventBus::builder()
 | `user.*` | 匹配单段 | 匹配 `user.created`，不匹配 `user.foo.bar` |
 | `user.**` | 匹配多段 | 匹配 `user.created` 和 `user.foo.bar` |
 | `user.created` | 精确匹配 | 仅匹配 `user.created` |
+
+## System Management 系统管理
+
+anycms-event 提供三大系统管理模块，支持事件发现、执行追踪和动态触发规则配置。
+
+### P1: Event Registry 事件注册表
+
+自动跟踪已注册事件，支持事件发现和元数据查询：
+
+```rust
+// 事件在 publish/subscribe 时自动注册
+bus.publish(UserCreated { user_id: 1, name: "Alice".into() }).await.unwrap();
+
+let registry = bus.registry();
+
+// 列出所有已注册事件
+for desc in registry.list_all() {
+    println!("{} (topic: {}, 发布次数: {})", desc.event_name, desc.topic, desc.publish_count);
+}
+
+// 按条件查询
+let user_events = registry.query(EventQuery {
+    name: Some("user.*".to_string()),  // 支持前缀通配
+    topic: Some("user".to_string()),
+    tags: vec!["auth".to_string()],
+    search: Some("created".to_string()),  // 文本搜索
+    limit: Some(10),
+    offset: Some(0),
+    ..Default::default()
+});
+
+// 手动注册带完整元数据的事件
+registry.register(EventDescriptor {
+    event_name: "system.maintenance".to_string(),
+    topic: "system".to_string(),
+    description: "系统维护事件".to_string(),
+    schema: Some(serde_json::json!({"type": "object", "properties": {...}})),
+    source_module: Some("anycms-system".to_string()),
+    tags: vec!["system".to_string()],
+    ..Default::default()
+});
+```
+
+### P2: Execution Log 执行日志
+
+记录和查询事件发布和 Handler 执行历史：
+
+```rust
+use anycms_event::execution_log::{ExecutionLog, ExecutionLogTelemetry, ExecutionLogQuery};
+
+// 创建共享存储，Telemetry 和查询接口使用同一个后端
+let log = Arc::new(ExecutionLog::in_memory());
+let bus = EventBus::builder()
+    .telemetry(ExecutionLogTelemetry::new(ExecutionLog::in_memory()))
+    .execution_log(log.clone())
+    .build();
+
+// 发布事件后查询执行日志
+bus.publish(UserCreated { user_id: 1, name: "Alice".into() }).await.unwrap();
+
+let log = bus.execution_log().unwrap();
+
+// 查询所有发布记录
+let publishes = log.query(ExecutionLogQuery {
+    execution_type: Some(ExecutionType::Publish),
+    ..Default::default()
+});
+
+// 查询失败的 Handler 执行
+let failures = log.query(ExecutionLogQuery {
+    status: Some(ExecutionStatus::Failed),
+    event_name: Some("user.created".to_string()),
+    since: Some(std::time::SystemTime::now() - Duration::from_secs(3600)),
+    limit: Some(50),
+    ..Default::default()
+});
+```
+
+### P3: Trigger Rule Engine 触发规则引擎
+
+动态配置事件到动作的映射规则，可与 WorkflowEngine 集成：
+
+```rust
+use anycms_event::trigger::{TriggerRuleEngine, TriggerRule, TriggerContext};
+
+let trigger_engine = TriggerRuleEngine::new(bus.clone());
+
+// 注册动作处理器
+trigger_engine.register_action("workflow", |ctx: TriggerContext| {
+    // 在这里调用 WorkflowEngine.emit()
+    // workflow_engine.emit(&ctx.event_name, ctx.event_data, &entity_id).await
+    async move { Ok(()) }
+});
+
+trigger_engine.register_action("notify", |ctx: TriggerContext| {
+    // 发送通知
+    async move { Ok(()) }
+});
+
+// 动态配置触发规则
+trigger_engine.add_rule(TriggerRule {
+    id: "content-sitemap".into(),
+    name: "内容发布→生成 Sitemap".into(),
+    event_pattern: "content.published".into(),
+    condition: None,
+    action_type: "workflow".into(),
+    action_config: serde_json::json!({"workflow_id": "generate-sitemap"}),
+    enabled: true,
+    priority: 0,
+});
+
+// 带条件过滤的规则
+trigger_engine.add_rule(TriggerRule {
+    id: "vip-order".into(),
+    name: "VIP 订单处理".into(),
+    event_pattern: "order.placed".into(),
+    condition: Some(serde_json::json!({
+        "amount": {"$gt": 1000},
+        "customer_level": {"$gte": 3}
+    })),
+    action_type: "workflow".into(),
+    action_config: serde_json::json!({"workflow_id": "vip-handler"}),
+    enabled: true,
+    priority: 0,
+});
+
+// 运行时管理规则
+trigger_engine.disable_rule("content-sitemap");   // 禁用
+trigger_engine.enable_rule("content-sitemap");    // 启用
+trigger_engine.remove_rule("vip-order");          // 删除
+trigger_engine.list_rules();                      // 列出所有
+
+// 处理事件
+let results = trigger_engine.process_event("content.published", &data).await;
+```
+
+条件匹配操作符：
+
+| 操作符 | 说明 | 示例 |
+|--------|------|------|
+| `$eq` | 等于 | `{"status": {"$eq": "published"}}` |
+| `$ne` | 不等于 | `{"status": {"$ne": "draft"}}` |
+| `$gt` / `$gte` | 大于 / 大于等于 | `{"amount": {"$gt": 100}}` |
+| `$lt` / `$lte` | 小于 / 小于等于 | `{"amount": {"$lt": 1000}}` |
+| `$in` | 包含在列表中 | `{"category": {"$in": ["books", "tech"]}}` |
+| `$contains` | 字符串包含 | `{"title": {"$contains": "Rust"}}` |
 
 ## Telemetry 遥测
 
@@ -213,6 +367,7 @@ let bus = EventBus::builder()
 内置实现：
 - `TracingTelemetry` — 基于 tracing 的结构化日志
 - `NoopTelemetry` — 空操作，用于禁用遥测
+- `ExecutionLogTelemetry` — 将事件生命周期记录到执行日志
 
 ## Testing 测试工具
 
@@ -407,6 +562,7 @@ async fn main() {
 | [遥测中间件](examples/telemetry.rs) | 自定义 Telemetry + Builder 模式 | `cargo run --example telemetry` |
 | [SSE + Axum](examples/sse_axum.rs) | SSE 实时推流 + Axum 集成 | `cargo run --example sse_axum` |
 | [SSE + Actix](examples/sse_actix.rs) | SSE 实时推流 + Actix-web 集成 | `cargo run --example sse_actix` |
+| [触发规则引擎](examples/trigger_workflow.rs) | 系统管理功能：Registry + Trigger Engine | `cargo run --example trigger_workflow` |
 
 ## Error Handling
 
@@ -422,6 +578,24 @@ match bus.publish(event).await {
     }
     Err(_) => { /* 其他错误 */ }
 }
+```
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│              Trigger Rule Engine (P3)                     │
+│  规则 CRUD / 事件模式匹配 / JSON 条件过滤 / 动作执行       │
+│  register_action("workflow", |ctx| WorkflowEngine.emit()) │
+├──────────────────────────────────────────────────────────┤
+│        Event Registry (P1)      Execution Log (P2)       │
+│  事件发现/查询/搜索/元数据       执行记录/状态/耗时追踪     │
+│  bus.registry().query(...)      bus.execution_log()      │
+├──────────────────────────────────────────────────────────┤
+│                   Core EventBus                           │
+│  publish / subscribe / pattern matching / telemetry       │
+│  derive macros / SSE / Redis transport                    │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## License

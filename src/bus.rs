@@ -14,6 +14,8 @@ use tokio::task::AbortHandle;
 
 use crate::error::{EventBusError, PublishErrorReason, Result};
 use crate::event::Event;
+use crate::registry::EventRegistry;
+use crate::execution_log::ExecutionLog;
 use crate::telemetry::Telemetry;
 
 /// Type-erased event payload. Events are wrapped in `Arc<dyn Any + Send + Sync>`
@@ -112,12 +114,16 @@ struct EventBusInner {
     capacity: usize,
     /// 可插拔的遥测层，用于监控发布/订阅生命周期。
     telemetry: Option<Arc<dyn Telemetry>>,
+    /// 事件注册表，跟踪已注册的事件类型及其元数据。
+    registry: Arc<EventRegistry>,
+    /// 执行日志，用于查询事件发布和 Handler 执行的历史记录。
+    execution_log: Option<Arc<ExecutionLog>>,
 }
 
 impl EventBus {
     /// Create a new event bus with the default channel capacity (1024).
     pub fn new() -> Self {
-        Self::from_builder(1024, None)
+        Self::from_builder(1024, None, Arc::new(EventRegistry::new()), None)
     }
 
     /// Create a new event bus with the specified broadcast channel capacity.
@@ -125,11 +131,16 @@ impl EventBus {
     /// The capacity controls how many messages can be buffered before slow
     /// subscribers start being lagged (dropping old messages).
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::from_builder(capacity, None)
+        Self::from_builder(capacity, None, Arc::new(EventRegistry::new()), None)
     }
 
     /// 从构建器参数创建 EventBus（内部方法）。
-    pub(crate) fn from_builder(capacity: usize, telemetry: Option<Arc<dyn Telemetry>>) -> Self {
+    pub(crate) fn from_builder(
+        capacity: usize,
+        telemetry: Option<Arc<dyn Telemetry>>,
+        registry: Arc<EventRegistry>,
+        execution_log: Option<Arc<ExecutionLog>>,
+    ) -> Self {
         let (global_tx, _) = broadcast::channel(capacity);
         Self {
             inner: Arc::new(EventBusInner {
@@ -139,6 +150,8 @@ impl EventBus {
                 next_sub_id: AtomicUsize::new(0),
                 capacity,
                 telemetry,
+                registry,
+                execution_log,
             }),
         }
     }
@@ -146,6 +159,20 @@ impl EventBus {
     /// 返回一个 [`EventBusBuilder`] 用于配置 EventBus。
     pub fn builder() -> crate::builder::EventBusBuilder {
         crate::builder::EventBusBuilder::new()
+    }
+
+    /// 获取事件注册表引用。
+    ///
+    /// 注册表跟踪所有已发布/订阅的事件类型及其元数据。
+    pub fn registry(&self) -> &Arc<EventRegistry> {
+        &self.inner.registry
+    }
+
+    /// 获取执行日志引用（如果已配置）。
+    ///
+    /// 执行日志记录了事件发布和 Handler 执行的历史。
+    pub fn execution_log(&self) -> Option<&Arc<ExecutionLog>> {
+        self.inner.execution_log.as_ref()
     }
 
     /// Get or create a broadcast channel for the given event type.
@@ -165,7 +192,13 @@ impl EventBus {
         let mut channels = self.inner.channels.write().unwrap();
         channels
             .entry(E::event_name().to_string())
-            .or_insert_with(|| broadcast::channel(self.inner.capacity).0)
+            .or_insert_with(|| {
+                // Auto-register in registry when channel is first created
+                if !self.inner.registry.contains(E::event_name()) {
+                    self.inner.registry.register_simple(E::event_name(), E::topic());
+                }
+                broadcast::channel(self.inner.capacity).0
+            })
             .clone()
     }
 
@@ -183,6 +216,12 @@ impl EventBus {
     /// unexpected error.
     pub async fn publish<E: Event>(&self, event: E) -> Result<()> {
         let start = std::time::Instant::now();
+
+        // Auto-register event in registry if not yet registered
+        if !self.inner.registry.contains(E::event_name()) {
+            self.inner.registry.register_simple(E::event_name(), E::topic());
+        }
+        self.inner.registry.increment_publish_count(E::event_name());
 
         // Fast path: check if channel exists with read lock
         let sender = {
@@ -285,6 +324,10 @@ impl EventBus {
 
         let event_name = E::event_name().to_string();
         let id = self.inner.next_sub_id.fetch_add(1, Ordering::Relaxed);
+
+        // Update registry subscriber count
+        let sub_count = sender.receiver_count();
+        self.inner.registry.set_subscriber_count(&event_name, sub_count);
 
         // Clone telemetry Arc for use inside the spawned task
         let telemetry = self.inner.telemetry.clone();

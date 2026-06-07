@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use crate::bus::EventBus;
+use crate::execution_log::ExecutionLog;
+use crate::registry::EventRegistry;
 use crate::telemetry::Telemetry;
 
 /// EventBus 构建器，提供流畅的配置 API。
@@ -12,25 +14,32 @@ use crate::telemetry::Telemetry;
 /// ```ignore
 /// use anycms_event::prelude::*;
 /// use anycms_event::telemetry::TracingTelemetry;
+/// use anycms_event::registry::EventRegistry;
 ///
+/// let registry = Arc::new(EventRegistry::new());
 /// let bus = EventBus::builder()
 ///     .capacity(2048)
 ///     .telemetry(TracingTelemetry)
+///     .registry(registry)
 ///     .build();
 /// ```
 pub struct EventBusBuilder {
     capacity: usize,
     telemetry: Option<Arc<dyn Telemetry>>,
+    registry: Option<Arc<EventRegistry>>,
+    execution_log: Option<Arc<ExecutionLog>>,
 }
 
 impl EventBusBuilder {
     /// 创建一个新的构建器，使用默认值。
     ///
-    /// 默认容量为 1024，无遥测。
+    /// 默认容量为 1024，无遥测，自动创建空注册表。
     pub fn new() -> Self {
         Self {
             capacity: 1024,
             telemetry: None,
+            registry: None,
+            execution_log: None,
         }
     }
 
@@ -50,9 +59,27 @@ impl EventBusBuilder {
         self
     }
 
+    /// 设置自定义事件注册表。
+    ///
+    /// 如果不设置，构建时会自动创建一个空注册表。
+    pub fn registry(mut self, registry: Arc<EventRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// 设置执行日志。
+    ///
+    /// 执行日志记录事件发布和 Handler 执行的历史记录。
+    /// 通常与 [`ExecutionLogTelemetry`](crate::execution_log::ExecutionLogTelemetry) 一起使用。
+    pub fn execution_log(mut self, log: Arc<ExecutionLog>) -> Self {
+        self.execution_log = Some(log);
+        self
+    }
+
     /// 消费构建器并返回配置好的 [`EventBus`]。
     pub fn build(self) -> EventBus {
-        EventBus::from_builder(self.capacity, self.telemetry)
+        let registry = self.registry.unwrap_or_else(|| Arc::new(EventRegistry::new()));
+        EventBus::from_builder(self.capacity, self.telemetry, registry, self.execution_log)
     }
 }
 
@@ -72,6 +99,7 @@ mod tests {
         let builder = EventBusBuilder::new();
         assert_eq!(builder.capacity, 1024);
         assert!(builder.telemetry.is_none());
+        assert!(builder.registry.is_none());
     }
 
     #[test]
@@ -87,7 +115,36 @@ mod tests {
     }
 
     #[test]
+    fn builder_with_registry() {
+        let registry = Arc::new(EventRegistry::new());
+        let builder = EventBusBuilder::new().registry(registry);
+        assert!(builder.registry.is_some());
+    }
+
+    #[test]
     fn builder_builds_event_bus() {
         let _bus = EventBusBuilder::new().capacity(512).build();
+    }
+
+    #[test]
+    fn builder_builds_with_custom_registry() {
+        let registry = Arc::new(EventRegistry::new());
+        let bus = EventBusBuilder::new().registry(registry.clone()).build();
+        assert!(Arc::ptr_eq(bus.registry(), &registry));
+    }
+
+    #[test]
+    fn builder_with_execution_log() {
+        let log = Arc::new(ExecutionLog::in_memory());
+        let builder = EventBusBuilder::new().execution_log(log);
+        assert!(builder.execution_log.is_some());
+    }
+
+    #[test]
+    fn builder_builds_with_execution_log() {
+        let log = Arc::new(ExecutionLog::in_memory());
+        let bus = EventBusBuilder::new().execution_log(log.clone()).build();
+        assert!(bus.execution_log().is_some());
+        assert!(Arc::ptr_eq(bus.execution_log().unwrap(), &log));
     }
 }
