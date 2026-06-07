@@ -4,20 +4,82 @@
 //! and [`BridgedEventBus`] for bidirectional bridging between local and remote
 //! event bus instances.
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use redis::AsyncCommands;
-use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::task::JoinHandle;
 use tracing;
 
 use anycms_event::bus::Subscription;
-use anycms_event::{EventBus, EventBusError, Event};
+use anycms_event::{Event, EventBus, EventBusError};
+use anycms_event::error::PublishErrorReason;
 
 use crate::error::{RedisTransportError, Result};
 
 /// Default channel prefix for Redis Pub/Sub channels.
 const DEFAULT_CHANNEL_PREFIX: &str = "anycms:event:";
+
+/// Global counter used to generate unique source IDs for each bus instance.
+static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a unique source ID combining the current process ID with a
+/// monotonically increasing counter. No external dependencies required.
+fn generate_source_id() -> String {
+    format!(
+        "{}:{}",
+        std::process::id(),
+        NEXT_SOURCE_ID.fetch_add(1, AtomicOrdering::Relaxed)
+    )
+}
+
+// ----------------------------------------------------------------------------
+// RedisMessage envelope
+// ----------------------------------------------------------------------------
+
+/// Message envelope for Redis transport.
+///
+/// Wraps the serialized event payload with a `source_id` so that receivers
+/// can detect and discard messages they published themselves (echo prevention).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RedisMessage {
+    /// Unique ID of the originating process/bus instance.
+    source_id: String,
+    /// JSON-serialized event payload.
+    payload: String,
+}
+
+// ----------------------------------------------------------------------------
+// ForwarderHandle
+// ----------------------------------------------------------------------------
+
+/// Handle to a running Redis forwarder task.
+///
+/// Drop the handle to let the task run until the connection closes naturally,
+/// or call [`ForwarderHandle::stop`] to abort it immediately.
+pub struct ForwarderHandle {
+    handle: JoinHandle<()>,
+}
+
+impl ForwarderHandle {
+    /// Gracefully stop the forwarder task by aborting it.
+    ///
+    /// This is idempotent — calling it multiple times has no effect.
+    pub fn stop(&self) {
+        self.handle.abort();
+    }
+
+    /// Check if the forwarder task has stopped.
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// RedisTransport
+// ----------------------------------------------------------------------------
 
 /// Redis-based transport for distributed event bus.
 ///
@@ -26,9 +88,18 @@ const DEFAULT_CHANNEL_PREFIX: &str = "anycms:event:";
 ///
 /// # Channel Naming
 ///
-/// Each event type gets its own Redis channel named after the event's [`Event::event_name()`],
-/// prefixed with [`DEFAULT_CHANNEL_PREFIX`]. For example, an event with `event_name() = "user.created"`
-/// publishes to the Redis channel `"anycms:event:user.created"`.
+/// Each event type gets its own Redis channel named after the event's
+/// [`Event::event_name()`], prefixed with [`DEFAULT_CHANNEL_PREFIX`].
+/// For example, an event with `event_name() = "user.created"` publishes
+/// to the Redis channel `"anycms:event:user.created"`.
+///
+/// # Echo Prevention
+///
+/// Each [`BridgedEventBus`] instance carries a unique `source_id`. When
+/// publishing to Redis the event is wrapped in a [`RedisMessage`] envelope
+/// that includes this source ID. Forwarders check the source ID and skip
+/// messages that originated from the same bus instance, preventing local
+/// subscribers from receiving duplicate events.
 ///
 /// # Example
 ///
@@ -46,7 +117,9 @@ const DEFAULT_CHANNEL_PREFIX: &str = "anycms:event:";
 /// ```
 pub struct RedisTransport {
     client: redis::Client,
-    conn: Arc<RwLock<Option<redis::aio::ConnectionManager>>>,
+    /// Connection manager — internally thread-safe and auto-reconnects.
+    /// No `RwLock`/`Option` needed; `ConnectionManager` handles reconnection.
+    conn: redis::aio::ConnectionManager,
     channel_prefix: String,
 }
 
@@ -74,7 +147,7 @@ impl RedisTransport {
             .map_err(|e| RedisTransportError::ConnectionError(e.to_string()))?;
 
         // Verify connectivity by creating the connection manager upfront.
-        let conn_mgr = client
+        let conn = client
             .get_connection_manager()
             .await
             .map_err(|e| RedisTransportError::ConnectionError(e.to_string()))?;
@@ -87,20 +160,17 @@ impl RedisTransport {
 
         Ok(Self {
             client,
-            conn: Arc::new(RwLock::new(Some(conn_mgr))),
+            conn,
             channel_prefix: prefix.to_string(),
         })
     }
 
-    /// Get a connection from the connection manager.
+    /// Get a clone of the connection manager.
     ///
-    /// Returns an error if the transport has not been started or the connection
-    /// manager has been taken.
-    async fn get_conn(&self) -> Result<redis::aio::ConnectionManager> {
-        let guard = self.conn.read().await;
-        guard
-            .clone()
-            .ok_or(RedisTransportError::NotStarted)
+    /// `ConnectionManager` is internally thread-safe and auto-reconnects,
+    /// so cloning is cheap and always succeeds.
+    async fn get_conn(&self) -> redis::aio::ConnectionManager {
+        self.conn.clone()
     }
 
     /// Build the full Redis channel name for a given event name.
@@ -111,15 +181,15 @@ impl RedisTransport {
     /// Publish a serialized event payload to a Redis Pub/Sub channel.
     ///
     /// The `event_name` is used to construct the channel name (with prefix).
-    /// The `payload` should be a pre-serialized JSON string.
+    /// The `payload` should be a pre-serialized JSON string (typically a
+    /// [`RedisMessage`] envelope).
     ///
     /// # Errors
     ///
-    /// Returns [`RedisTransportError::PublishError`] if the publish command fails,
-    /// or [`RedisTransportError::NotStarted`] if the transport is not connected.
+    /// Returns [`RedisTransportError::PublishError`] if the publish command fails.
     pub async fn publish(&self, event_name: &str, payload: &str) -> Result<()> {
         let channel = self.channel_name(event_name);
-        let mut conn = self.get_conn().await?;
+        let mut conn = self.get_conn().await;
         let _: () = conn
             .publish(&channel, payload)
             .await
@@ -136,37 +206,55 @@ impl RedisTransport {
     /// 2. Subscribes to the channel for the given event type `E`.
     /// 3. Deserializes each incoming message and publishes it locally.
     ///
+    /// Messages that originated from the same bus instance (same `source_id`)
+    /// are silently discarded to prevent echo.
+    ///
+    /// If the connection drops, the task automatically reconnects with
+    /// exponential backoff (100 ms base, up to 30 s max).
+    ///
+    /// # Arguments
+    ///
+    /// * `bus` — The local event bus to forward events into.
+    /// * `source_id` — Unique identifier for this bus instance, used for
+    ///   echo prevention.
+    ///
+    /// # Returns
+    ///
+    /// A [`ForwarderHandle`] that can be used to stop the forwarder task.
+    ///
     /// # Errors
     ///
-    /// Returns [`RedisTransportError::SubscribeError`] if the subscription
-    /// cannot be established.
-    ///
-    /// # Important
-    ///
-    /// Events received from Redis and forwarded to the local bus are published
-    /// using [`EventBus::publish`], which means local subscribers will see them.
-    /// To avoid infinite loops when using [`BridgedEventBus`], the bridged bus
-    /// uses [`EventBus::publish`] directly (local-only) for forwarded events,
-    /// and the bridge's own `publish` method handles the Redis side.
-    pub async fn start_forwarder<E: Event>(&self, bus: EventBus) -> Result<()> {
+    /// Returns [`RedisTransportError::SubscribeError`] if the initial
+    /// subscription cannot be established (the task itself retries on failure).
+    pub async fn start_forwarder<E: Event + Serialize + DeserializeOwned>(
+        &self,
+        bus: EventBus,
+        source_id: String,
+    ) -> Result<ForwarderHandle> {
         let channel = self.channel_name(E::event_name());
         let client = self.client.clone();
 
         tracing::info!(
             channel = %channel,
             event = %E::event_name(),
+            source_id = %source_id,
             "Starting Redis event forwarder"
         );
 
         // Spawn a task that manages the pub/sub connection lifecycle.
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let base_delay = std::time::Duration::from_millis(100);
+            let max_delay = std::time::Duration::from_secs(30);
+            let mut attempt = 0u32;
+
             loop {
-                match Self::run_forwarder::<E>(&client, &channel, &bus).await {
+                match Self::run_forwarder::<E>(&client, &channel, &bus, &source_id).await {
                     Ok(()) => {
                         tracing::warn!(
                             channel = %channel,
                             "Redis forwarder exited cleanly, reconnecting..."
                         );
+                        attempt = 0; // reset on clean exit
                     }
                     Err(e) => {
                         tracing::error!(
@@ -174,22 +262,37 @@ impl RedisTransport {
                             error = %e,
                             "Redis forwarder error, reconnecting..."
                         );
+                        attempt += 1;
                     }
                 }
-                // Brief pause before reconnecting to avoid tight loops.
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                // Exponential backoff: 100ms, 200ms, 400ms, ..., up to 30s
+                let exp = 2u32.saturating_pow(attempt.min(8));
+                let delay = base_delay.saturating_mul(exp).min(max_delay);
+                tracing::debug!(
+                    channel = %channel,
+                    attempt = attempt,
+                    delay_ms = delay.as_millis(),
+                    "Reconnecting after backoff"
+                );
+                tokio::time::sleep(delay).await;
             }
         });
 
-        Ok(())
+        Ok(ForwarderHandle { handle })
     }
 
     /// Inner loop for the forwarder: subscribes and processes messages until
     /// the connection drops.
-    async fn run_forwarder<E: Event>(
+    ///
+    /// Incoming messages are expected to be [`RedisMessage`] envelopes.
+    /// Messages whose `source_id` matches our own are silently skipped
+    /// (echo prevention).
+    async fn run_forwarder<E: Event + Serialize + DeserializeOwned>(
         client: &redis::Client,
         channel: &str,
         bus: &EventBus,
+        source_id: &str,
     ) -> Result<()> {
         let mut pubsub = client
             .get_async_pubsub()
@@ -214,26 +317,48 @@ impl RedisTransport {
                     tracing::debug!(
                         channel = %channel_name,
                         bytes = data.len(),
-                        "Received event from Redis"
+                        "Received message from Redis"
                     );
 
-                    // Publish to the local event bus. Subscribers on this bus
-                    // will receive the deserialized event.
-                    match serde_json::from_str::<E>(&data) {
-                        Ok(event) => {
-                            if let Err(e) = bus.publish(event).await {
-                                tracing::error!(
-                                    channel = %channel_name,
-                                    error = %e,
-                                    "Failed to forward event to local bus"
-                                );
+                    // Unwrap the RedisMessage envelope.
+                    match serde_json::from_str::<RedisMessage>(&data) {
+                        Ok(redis_msg) if redis_msg.source_id == source_id => {
+                            // Echo from ourselves — skip.
+                            tracing::debug!(
+                                channel = %channel_name,
+                                source_id = %redis_msg.source_id,
+                                "Skipping echoed event from self"
+                            );
+                            continue;
+                        }
+                        Ok(redis_msg) => {
+                            // Deserialize the inner event and publish locally.
+                            match serde_json::from_str::<E>(&redis_msg.payload) {
+                                Ok(event) => {
+                                    if let Err(e) = bus.publish(event).await {
+                                        tracing::error!(
+                                            channel = %channel_name,
+                                            error = %e,
+                                            "Failed to forward event to local bus"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        channel = %channel_name,
+                                        error = %e,
+                                        "Failed to deserialize event from Redis"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
+                            // Could be a legacy message without the envelope, or
+                            // corrupt data.
                             tracing::error!(
                                 channel = %channel_name,
                                 error = %e,
-                                "Failed to deserialize event from Redis"
+                                "Failed to deserialize RedisMessage envelope"
                             );
                         }
                     }
@@ -259,6 +384,8 @@ impl RedisTransport {
     /// [`BridgedEventBus::forward_from_redis`] for each event type you want
     /// to receive from remote processes.
     ///
+    /// Each bridged bus instance gets a unique `source_id` for echo prevention.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -282,6 +409,7 @@ impl RedisTransport {
         Ok(BridgedEventBus {
             inner: bus,
             transport: Arc::new(self.clone()),
+            source_id: generate_source_id(),
         })
     }
 }
@@ -297,6 +425,8 @@ impl Clone for RedisTransport {
 }
 
 // ----------------------------------------------------------------------------
+// BridgedEventBus
+// ----------------------------------------------------------------------------
 
 /// An [`EventBus`] bridged with a Redis transport.
 ///
@@ -305,32 +435,55 @@ impl Clone for RedisTransport {
 ///
 /// Use [`BridgedEventBus::forward_from_redis`] to start receiving events from
 /// Redis for a specific event type.
+///
+/// Each `BridgedEventBus` carries a unique `source_id` so that the forwarder
+/// can detect and discard messages published by the same instance, preventing
+/// local subscribers from receiving duplicate events.
 pub struct BridgedEventBus {
     inner: EventBus,
     transport: Arc<RedisTransport>,
+    /// Unique identifier for this bus instance, used to prevent echo.
+    source_id: String,
 }
 
 impl BridgedEventBus {
     /// Publish an event to both the local bus and Redis.
     ///
-    /// The event is serialized to JSON and sent to the Redis channel named
-    /// after the event type. Local subscribers also receive the event.
+    /// The event is:
+    /// 1. Published to local subscribers (via the type-erased broadcast channel).
+    /// 2. Wrapped in a [`RedisMessage`] envelope and published to the Redis
+    ///    channel named after the event type.
     ///
     /// # Errors
     ///
     /// Returns [`EventBusError::PublishFailed`] if local publish fails,
     /// or [`EventBusError::TransportError`] if the Redis publish fails.
-    pub async fn publish<E: Event>(&self, event: E) -> anycms_event::Result<()> {
+    pub async fn publish<E: Event + Serialize + DeserializeOwned>(
+        &self,
+        event: E,
+    ) -> anycms_event::Result<()> {
         // 1. Publish to local subscribers.
         self.inner.publish(event.clone()).await?;
 
-        // 2. Serialize and publish to Redis.
-        let payload = serde_json::to_string(&event)
-            .map_err(|e| EventBusError::PublishFailed(e.to_string()))?;
+        // 2. Serialize, wrap in RedisMessage envelope, and publish to Redis.
+        let inner_payload = serde_json::to_string(&event)
+            .map_err(|e| EventBusError::PublishFailed {
+                event_name: E::event_name(),
+                reason: PublishErrorReason::SerializationError(e.to_string()),
+            })?;
+        let msg = RedisMessage {
+            source_id: self.source_id.clone(),
+            payload: inner_payload,
+        };
+        let redis_payload = serde_json::to_string(&msg)
+            .map_err(|e| EventBusError::PublishFailed {
+                event_name: E::event_name(),
+                reason: PublishErrorReason::SerializationError(e.to_string()),
+            })?;
         self.transport
-            .publish(E::event_name(), &payload)
+            .publish(E::event_name(), &redis_payload)
             .await
-            .map_err(|e| EventBusError::TransportError(e.to_string()))?;
+            .map_err(|e| EventBusError::TransportError { message: e.to_string() })?;
 
         Ok(())
     }
@@ -361,14 +514,21 @@ impl BridgedEventBus {
     ///
     /// After calling this, any event of type `E` published to the Redis channel
     /// (by another process) will be deserialized and published to the local
-    /// [`EventBus`], triggering any local subscribers.
+    /// [`EventBus`], triggering any local subscribers. Events that originated
+    /// from this same bus instance are silently discarded (echo prevention).
+    ///
+    /// # Returns
+    ///
+    /// A [`ForwarderHandle`] that can be used to stop the forwarder task.
     ///
     /// # Errors
     ///
     /// Returns a [`RedisTransportError`] if the subscription cannot be established.
-    pub async fn forward_from_redis<E: Event>(&self) -> Result<()> {
+    pub async fn forward_from_redis<E: Event + Serialize + DeserializeOwned>(
+        &self,
+    ) -> Result<ForwarderHandle> {
         self.transport
-            .start_forwarder::<E>(self.inner.clone())
+            .start_forwarder::<E>(self.inner.clone(), self.source_id.clone())
             .await
     }
 
@@ -385,6 +545,7 @@ impl Clone for BridgedEventBus {
         Self {
             inner: self.inner.clone(),
             transport: self.transport.clone(),
+            source_id: self.source_id.clone(),
         }
     }
 }

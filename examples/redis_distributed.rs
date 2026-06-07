@@ -18,9 +18,10 @@ use anycms_event::event_bus;
 use anycms_event_redis::RedisTransport;
 
 // ── 定义事件 ──────────────────────────────────────────────────────
+// 使用 (redis) 属性，宏自动生成 bridge() 方法和 BridgedAppEventBus 类型
 
 event_bus! {
-    bus AppEventBus {
+    bus AppEventBus(redis) {
         event UserCreated { user_id: u64, username: String }
         event OrderPlaced { order_id: u64, product: String, amount: f64 }
     }
@@ -48,15 +49,12 @@ async fn main() {
     println!("✅ Redis 连接成功");
     println!();
 
-    // ── 2. 创建 Node B (消费者) ───────────────────────────────
+    // ── 2. 创建 Node B (消费者) — 一行 bridge 搞定 ────────────
     println!("🔔 启动 Node B — 事件消费者");
     let bus_b = AppEventBus::new();
-    let bridged_b = transport.bridge(bus_b.inner().clone()).await.unwrap();
-
-    // 启动 Redis → 本地 转发器 (订阅两种事件)
-    bridged_b.forward_from_redis::<UserCreated>().await.unwrap();
-    bridged_b.forward_from_redis::<OrderPlaced>().await.unwrap();
-    println!("   已订阅 Redis 频道: user.created, order.placed");
+    let bridged_b = bus_b.bridge(&transport).await.unwrap();
+    println!("   ✅ bridge() 自动完成: 连接 Redis + 转发所有事件类型");
+    println!();
 
     // 统计计数
     let user_count = Arc::new(AtomicUsize::new(0));
@@ -85,12 +83,11 @@ async fn main() {
 
     // 等待 Redis 订阅就绪
     tokio::time::sleep(Duration::from_millis(200)).await;
-    println!();
 
-    // ── 3. 创建 Node A (生产者) ───────────────────────────────
+    // ── 3. 创建 Node A (生产者) — 同样一行 bridge ──────────────
     println!("🚀 启动 Node A — 事件生产者");
     let bus_a = AppEventBus::new();
-    let bridged_a = transport.bridge(bus_a.inner().clone()).await.unwrap();
+    let bridged_a = bus_a.bridge(&transport).await.unwrap();
     println!("   Node A 就绪，开始发布事件...");
     println!();
 
@@ -150,8 +147,6 @@ async fn main() {
     println!("━━━ 双向通信演示 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("   Node B 也通过 Redis 发布事件，Node A 可以接收:");
 
-    // Node A 也订阅 Redis 转发
-    bridged_a.forward_from_redis::<UserCreated>().await.unwrap();
     let a_received = Arc::new(AtomicUsize::new(0));
     let ar = a_received.clone();
     bridged_a.subscribe(move |e: UserCreated| {
@@ -178,4 +173,8 @@ async fn main() {
     println!("   ✅ Node A 从 Redis 接收到来自 Node B 的事件: {} 条", a_received.load(Ordering::SeqCst));
     println!();
     println!("🎉 双向通信验证通过！");
+    println!();
+    println!("💡 关键 API 对比:");
+    println!("   旧: transport.bridge(bus.inner().clone()) + forward_from_redis::<T>() × N");
+    println!("   新: bus.bridge(&transport)  ← 一行搞定所有事件类型的 bridge + forward");
 }

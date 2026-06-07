@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use anycms_event::prelude::*;
@@ -26,25 +25,28 @@ struct AutoNameEvent {
 async fn test_derive_event_with_manual_name() {
     let bus = EventBus::new();
     let counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
 
     let c = counter.clone();
+    let n = notify.clone();
     bus.subscribe(move |e: ManualEvent| {
         let c = c.clone();
+        let n = n.clone();
         async move {
             c.fetch_add(e.value as usize, Ordering::SeqCst);
+            n.notify_one();
             Ok(())
         }
     })
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     bus.publish(ManualEvent { value: 42 })
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for handler to complete (deterministic)
+    notify.notified().await;
 
     assert_eq!(counter.load(Ordering::SeqCst), 42);
 }
@@ -53,20 +55,22 @@ async fn test_derive_event_with_manual_name() {
 async fn test_derive_event_auto_name() {
     let bus = EventBus::new();
     let counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
 
     let c = counter.clone();
+    let n = notify.clone();
     bus.subscribe(move |e: AutoNameEvent| {
         let c = c.clone();
+        let n = n.clone();
         async move {
             assert_eq!(e.data, "hello");
             c.fetch_add(1, Ordering::SeqCst);
+            n.notify_one();
             Ok(())
         }
     })
     .await
     .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     bus.publish(AutoNameEvent {
         data: "hello".into(),
@@ -74,7 +78,8 @@ async fn test_derive_event_auto_name() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for handler to complete (deterministic)
+    notify.notified().await;
 
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
@@ -93,20 +98,22 @@ event_bus! {
 async fn test_event_bus_macro_basic() {
     let bus = TestBus::new();
     let counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
 
     let c = counter.clone();
+    let n = notify.clone();
     bus.subscribe(move |e: UserCreated| {
         let c = c.clone();
+        let n = n.clone();
         async move {
             assert_eq!(e.username, "alice");
             c.fetch_add(1, Ordering::SeqCst);
+            n.notify_one();
             Ok(())
         }
     })
     .await
     .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     bus.publish(UserCreated {
         user_id: 1,
@@ -115,7 +122,8 @@ async fn test_event_bus_macro_basic() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for handler to complete (deterministic)
+    notify.notified().await;
 
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
@@ -149,8 +157,6 @@ async fn test_event_bus_macro_multiple_events() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     bus.publish(UserCreated {
         user_id: 1,
         username: "alice".into(),
@@ -172,7 +178,10 @@ async fn test_event_bus_macro_multiple_events() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Spin-wait until both counters reach expected values
+    while user_counter.load(Ordering::SeqCst) < 1 || order_counter.load(Ordering::SeqCst) < 1 {
+        tokio::task::yield_now().await;
+    }
 
     assert_eq!(user_counter.load(Ordering::SeqCst), 1);
     assert_eq!(order_counter.load(Ordering::SeqCst), 1);
@@ -184,18 +193,21 @@ async fn test_event_bus_clone() {
     let bus2 = bus.clone();
 
     let counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
+
     let c = counter.clone();
+    let n = notify.clone();
     bus.subscribe(move |_: UserCreated| {
         let c = c.clone();
+        let n = n.clone();
         async move {
             c.fetch_add(1, Ordering::SeqCst);
+            n.notify_one();
             Ok(())
         }
     })
     .await
     .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Publish from cloned bus
     bus2.publish(UserCreated {
@@ -205,7 +217,8 @@ async fn test_event_bus_clone() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for handler to complete (deterministic)
+    notify.notified().await;
 
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }

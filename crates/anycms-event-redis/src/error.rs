@@ -21,9 +21,6 @@ pub enum RedisTransportError {
     #[error("Serialization error: {0}")]
     SerializationError(String),
 
-    /// The transport has not been started or connected yet.
-    #[error("Transport not started")]
-    NotStarted,
 }
 
 /// Convenience alias for results using [`RedisTransportError`].

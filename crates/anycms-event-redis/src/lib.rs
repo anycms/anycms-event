@@ -36,4 +36,4 @@ pub mod error;
 pub mod transport;
 
 pub use error::{RedisTransportError, Result};
-pub use transport::{BridgedEventBus, RedisTransport};
+pub use transport::{BridgedEventBus, ForwarderHandle, RedisTransport};

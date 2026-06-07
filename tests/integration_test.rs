@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -61,21 +60,24 @@ impl Event for OrderPlaced {
 async fn test_publish_subscribe_basic() {
     let bus = EventBus::new();
     let counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
 
     let counter_clone = counter.clone();
+    let notify_clone = notify.clone();
     bus.subscribe(move |event: UserCreated| {
         let c = counter_clone.clone();
+        let n = notify_clone.clone();
         async move {
             c.fetch_add(1, Ordering::SeqCst);
             assert_eq!(event.username, "alice");
+            n.notify_one();
             Ok(())
         }
     })
     .await
     .unwrap();
 
-    // Give the subscriber time to start listening
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // No sleep needed — subscribe uses std::sync::RwLock (sync registration)
 
     bus.publish(UserCreated {
         user_id: 1,
@@ -84,8 +86,8 @@ async fn test_publish_subscribe_basic() {
     .await
     .unwrap();
 
-    // Wait for async handler to process
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for handler to complete (deterministic)
+    notify.notified().await;
 
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
@@ -108,8 +110,6 @@ async fn test_multiple_subscribers() {
         .unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     bus.publish(UserCreated {
         user_id: 1,
         username: "bob".into(),
@@ -117,7 +117,10 @@ async fn test_multiple_subscribers() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Spin-wait until all 3 handlers have processed the event
+    while counter.load(Ordering::SeqCst) < 3 {
+        tokio::task::yield_now().await;
+    }
 
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
@@ -150,8 +153,6 @@ async fn test_multiple_event_types() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     bus.publish(UserCreated {
         user_id: 1,
         username: "alice".into(),
@@ -173,7 +174,10 @@ async fn test_multiple_event_types() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Spin-wait until both counters reach expected values
+    while user_counter.load(Ordering::SeqCst) < 2 || order_counter.load(Ordering::SeqCst) < 1 {
+        tokio::task::yield_now().await;
+    }
 
     assert_eq!(user_counter.load(Ordering::SeqCst), 2);
     assert_eq!(order_counter.load(Ordering::SeqCst), 1);
@@ -199,19 +203,21 @@ async fn test_event_bus_clone_shares_state() {
     let bus = EventBus::new();
     let bus2 = bus.clone();
     let counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
 
     let c = counter.clone();
+    let n = notify.clone();
     bus.subscribe(move |_: UserCreated| {
         let c = c.clone();
+        let n = n.clone();
         async move {
             c.fetch_add(1, Ordering::SeqCst);
+            n.notify_one();
             Ok(())
         }
     })
     .await
     .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Publish from the cloned bus — should reach the subscriber on the original
     bus2.publish(UserCreated {
@@ -221,7 +227,8 @@ async fn test_event_bus_clone_shares_state() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for handler to complete (deterministic)
+    notify.notified().await;
 
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
@@ -236,13 +243,14 @@ async fn test_handler_error_does_not_crash() {
         let c = c.clone();
         async move {
             c.fetch_add(1, Ordering::SeqCst);
-            Err(EventBusError::SubscriberError("intentional".into()))
+            Err(EventBusError::HandlerError {
+                event_name: "user.created".into(),
+                message: "intentional".into(),
+            })
         }
     })
     .await
     .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // First event — handler returns error but should not crash
     bus.publish(UserCreated {
@@ -252,7 +260,10 @@ async fn test_handler_error_does_not_crash() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Spin-wait until first event is processed
+    while counter.load(Ordering::SeqCst) < 1 {
+        tokio::task::yield_now().await;
+    }
 
     // Second event — handler should still be alive
     bus.publish(UserCreated {
@@ -262,7 +273,10 @@ async fn test_handler_error_does_not_crash() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Spin-wait until second event is processed
+    while counter.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
 
     // Both events should have been processed
     assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -272,19 +286,21 @@ async fn test_handler_error_does_not_crash() {
 async fn test_subscribe_pattern() {
     let bus = EventBus::new();
     let counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
 
     let c = counter.clone();
+    let n = notify.clone();
     bus.subscribe_pattern("user.*", move |_: UserCreated| {
         let c = c.clone();
+        let n = n.clone();
         async move {
             c.fetch_add(1, Ordering::SeqCst);
+            n.notify_one();
             Ok(())
         }
     })
     .await
     .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     bus.publish(UserCreated {
         user_id: 1,
@@ -293,7 +309,93 @@ async fn test_subscribe_pattern() {
     .await
     .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for handler to complete (deterministic)
+    notify.notified().await;
 
     assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_subscribe_pattern_routes_across_event_types() {
+    let bus = EventBus::new();
+    let user_events = Arc::new(AtomicUsize::new(0));
+
+    // Subscribe to "user.*" pattern for UserCreated
+    let uc = user_events.clone();
+    bus.subscribe_pattern("user.*", move |_: UserCreated| {
+        let uc = uc.clone();
+        async move {
+            uc.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .await
+    .unwrap();
+
+    // Publish UserCreated — should match "user.*"
+    bus.publish(UserCreated {
+        user_id: 1,
+        username: "alice".into(),
+    })
+    .await
+    .unwrap();
+
+    // Spin-wait until handler has processed the event
+    while user_events.load(Ordering::SeqCst) < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(user_events.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_subscription_unsubscribe() {
+    let bus = EventBus::new();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let c = counter.clone();
+    let sub = bus
+        .subscribe(move |_: UserCreated| {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    // Publish first event
+    bus.publish(UserCreated {
+        user_id: 1,
+        username: "first".into(),
+    })
+    .await
+    .unwrap();
+
+    // Spin-wait until first event is processed
+    while counter.load(Ordering::SeqCst) < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    // Unsubscribe
+    sub.unsubscribe();
+
+    // Give time for abort to take effect
+    tokio::task::yield_now().await;
+
+    // Publish second event — should NOT be received
+    bus.publish(UserCreated {
+        user_id: 2,
+        username: "second".into(),
+    })
+    .await
+    .unwrap();
+
+    // Yield a few times to ensure no handler runs
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(counter.load(Ordering::SeqCst), 1); // Still 1, second event was not received
 }

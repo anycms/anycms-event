@@ -8,14 +8,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 use anycms_event::prelude::*;
 
 // ── 1. 定义事件结构体 ──────────────────────────────────────────
-// 必须派生 Clone + Serialize + Deserialize (Event trait 有这些约束)
+// Event trait 要求 Clone + Send + Sync + 'static
+// 不再需要 Serialize/Deserialize（核心 bus 使用 Arc<dyn Any> 进行类型擦除）
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct UserLoggedIn {
     user_id: u64,
     ip_address: String,
@@ -31,7 +30,7 @@ impl Event for UserLoggedIn {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct PaymentReceived {
     order_id: u64,
     amount: f64,

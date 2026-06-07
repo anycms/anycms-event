@@ -80,7 +80,7 @@ fn camel_to_dotted(name: &str) -> String {
             //   - we are not at the start, AND
             //   - the previous char was lowercase OR the next char is lowercase
             //     (handles "HTTPServer" -> "H-T-T-P-Server" with proper splits)
-            let next_lower = chars.peek().map_or(false, |c| c.is_lowercase());
+            let next_lower = chars.peek().is_some_and(|c| c.is_lowercase());
             if prev_lower || next_lower {
                 if !result.is_empty() {
                     result.push('.');
@@ -247,6 +247,8 @@ struct EventBusDef {
     bus_name: Ident,
     events: Vec<EventDecl>,
     topics: Vec<TopicDecl>,
+    /// Whether the `redis` attribute was specified: `bus MyBus(redis) { ... }`
+    enable_redis: bool,
 }
 
 /// Helper: peek if the next token is a specific identifier (e.g. "bus", "event", "topic").
@@ -255,7 +257,7 @@ fn peek_keyword(input: &parse::ParseBuffer, keyword: &str) -> bool {
         && input
             .cursor()
             .ident()
-            .map_or(false, |(ident, _)| ident == keyword)
+            .is_some_and(|(ident, _)| ident == keyword)
 }
 
 /// Helper: parse a specific identifier keyword or error.
@@ -269,9 +271,22 @@ fn parse_keyword(input: parse::ParseStream, keyword: &str) -> syn::Result<()> {
 
 impl parse::Parse for EventBusDef {
     fn parse(input: parse::ParseStream) -> syn::Result<Self> {
-        // Expect `bus Ident { ... }`
+        // Expect `bus Ident` or `bus Ident(redis) { ... }`
         parse_keyword(input, "bus")?;
         let bus_name: Ident = input.parse()?;
+
+        // Optional `(redis)` attribute
+        let mut enable_redis = false;
+        if input.peek(syn::token::Paren) {
+            let paren_content;
+            syn::parenthesized!(paren_content in input);
+            let attr: Ident = paren_content.parse()?;
+            if attr != "redis" {
+                return Err(syn::Error::new(attr.span(), "expected `redis`"));
+            }
+            enable_redis = true;
+        }
+
         let content;
         braced!(content in input);
 
@@ -337,6 +352,7 @@ impl parse::Parse for EventBusDef {
             bus_name,
             events,
             topics,
+            enable_redis,
         })
     }
 }
@@ -469,7 +485,116 @@ pub fn event_bus(input: TokenStream) -> TokenStream {
     };
 
     // ------------------------------------------------------------------
-    // 4. Generate the typed EventBus newtype
+    // 4. Generate redis support (only when `redis` attr is set)
+    // ------------------------------------------------------------------
+    let forward_calls: Vec<proc_macro2::TokenStream> = def
+        .events
+        .iter()
+        .map(|event| {
+            let name = &event.name;
+            quote! {
+                handles.push(bridged.forward_from_redis::<#name>().await?);
+            }
+        })
+        .collect();
+
+    let redis_impl = if def.enable_redis && !def.events.is_empty() {
+
+        // Generate: bridge() method on the typed bus + Bridged wrapper type
+        let bridged_name = quote::format_ident!("Bridged{}", def.bus_name);
+
+        quote! {
+            /// A [`::anycms_event_redis::BridgedEventBus`] with all event types
+            /// automatically forwarded from Redis to the local bus.
+            ///
+            /// Created via [`#bus_name::bridge`]. Supports the same `publish` and
+            /// `subscribe` operations as a plain bus, with events also sent to/received
+            /// from Redis.
+            pub struct #bridged_name {
+                inner: ::anycms_event_redis::BridgedEventBus,
+                _forwarder_handles: ::std::vec::Vec<::anycms_event_redis::ForwarderHandle>,
+            }
+
+            impl #bridged_name {
+                /// Publish an event to both local subscribers and Redis.
+                pub async fn publish<E>(&self, event: E) -> ::anycms_event::Result<()>
+                where
+                    E: ::anycms_event::Event + ::std::clone::Clone
+                        + ::serde::Serialize + ::serde::de::DeserializeOwned,
+                {
+                    self.inner.publish(event).await
+                }
+
+                /// Subscribe to a specific event type on the local bus.
+                pub async fn subscribe<E, F, Fut>(&self, handler: F) -> ::anycms_event::Result<::anycms_event::bus::Subscription>
+                where
+                    E: ::anycms_event::Event,
+                    F: Fn(E) -> Fut + ::std::marker::Send + ::std::marker::Sync + 'static,
+                    Fut: ::std::future::Future<Output = ::anycms_event::Result<()>> + ::std::marker::Send + 'static,
+                {
+                    self.inner.subscribe::<E, F, Fut>(handler).await
+                }
+
+                /// Access the underlying [`::anycms_event_redis::BridgedEventBus`].
+                pub fn inner(&self) -> &::anycms_event_redis::BridgedEventBus {
+                    &self.inner
+                }
+            }
+
+            impl ::std::clone::Clone for #bridged_name {
+                fn clone(&self) -> Self {
+                    Self {
+                        inner: self.inner.clone(),
+                        // Forwarder handles are not clonable — the clone shares the
+                        // same forwarders from the original instance.
+                        _forwarder_handles: ::std::vec::Vec::new(),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let redis_bridge_method = if def.enable_redis && !def.events.is_empty() {
+        let bridged_name = quote::format_ident!("Bridged{}", def.bus_name);
+
+        quote! {
+            /// Bridge this bus with a Redis transport, automatically forwarding all
+            /// event types from Redis to the local bus.
+            ///
+            /// Returns a [`#bridged_name`] that supports `publish` and `subscribe`
+            /// with Redis integration. No need to call `forward_from_redis` manually.
+            ///
+            /// # Example
+            ///
+            /// ```ignore
+            /// let transport = RedisTransport::new("redis://127.0.0.1:6379").await?;
+            /// let bus = AppEventBus::new();
+            /// let bridged = bus.bridge(&transport).await?;
+            ///
+            /// bridged.subscribe(|e: UserCreated| async move { Ok(()) }).await?;
+            /// bridged.publish(UserCreated { ... }).await?; // local + Redis
+            /// ```
+            pub async fn bridge(
+                &self,
+                transport: &::anycms_event_redis::RedisTransport,
+            ) -> ::std::result::Result<#bridged_name, ::anycms_event_redis::RedisTransportError> {
+                let bridged = transport.bridge(self.inner.clone()).await?;
+                let mut handles = ::std::vec::Vec::new();
+                #(#forward_calls)*
+                Ok(#bridged_name {
+                    inner: bridged,
+                    _forwarder_handles: handles,
+                })
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // ------------------------------------------------------------------
+    // 5. Generate the typed EventBus newtype
     // ------------------------------------------------------------------
     let bus_impl = quote! {
         pub struct #bus_name {
@@ -507,6 +632,8 @@ pub fn event_bus(input: TokenStream) -> TokenStream {
             }
 
             #(#topic_subscribe_methods)*
+
+            #redis_bridge_method
         }
 
         impl ::std::clone::Clone for #bus_name {
@@ -531,6 +658,7 @@ pub fn event_bus(input: TokenStream) -> TokenStream {
         #(#event_structs)*
         #topic_enum
         #bus_impl
+        #redis_impl
     };
 
     expanded.into()

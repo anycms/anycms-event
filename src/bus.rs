@@ -3,26 +3,54 @@
 //! Uses `tokio::broadcast` channels internally for efficient fan-out
 //! pub/sub semantics with back-pressure support.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::broadcast;
+use tokio::task::AbortHandle;
 
-use crate::error::{EventBusError, Result};
+use crate::error::{EventBusError, PublishErrorReason, Result};
 use crate::event::Event;
 
-/// Default capacity for broadcast channels.
-const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
+/// Type-erased event payload. Events are wrapped in `Arc<dyn Any + Send + Sync>`
+/// so they can be sent through broadcast channels without serialization.
+type ErasedEvent = Arc<dyn Any + Send + Sync>;
 
-/// A subscription handle returned when subscribing to events.
-///
-/// Can be used in the future to unsubscribe or inspect subscription state.
+/// Wrapper used on the global dispatch channel.
+/// Carries the event name (used for pattern matching) alongside the type-erased payload.
+#[derive(Clone)]
+struct GlobalEvent {
+    event_name: String,
+    payload: ErasedEvent,
+}
+
+/// A subscription handle that allows unsubscribing or graceful shutdown.
 #[derive(Debug)]
 pub struct Subscription {
-    /// The event name this subscription is bound to.
+    /// The event name or pattern this subscription is bound to.
     pub event_name: String,
     /// Unique subscription identifier.
     pub id: usize,
+    /// Abort handle for cancelling the subscriber task.
+    abort_handle: AbortHandle,
+}
+
+impl Subscription {
+    /// Unsubscribe by aborting the background handler task.
+    ///
+    /// After calling this, the handler will no longer receive events.
+    /// This is idempotent — calling it multiple times has no effect.
+    pub fn unsubscribe(&self) {
+        self.abort_handle.abort();
+    }
+
+    /// Check if this subscription is still active.
+    pub fn is_finished(&self) -> bool {
+        self.abort_handle.is_finished()
+    }
 }
 
 /// Thread-safe, async event bus backed by tokio broadcast channels.
@@ -32,21 +60,24 @@ pub struct Subscription {
 /// The `EventBus` provides a publish/subscribe pattern where:
 /// - **Publishers** send typed events via [`EventBus::publish`].
 /// - **Subscribers** register async handlers via [`EventBus::subscribe`].
-/// - Events are serialized to JSON and sent through broadcast channels.
+/// - Events are type-erased via `Arc<dyn Any + Send + Sync>` and sent through
+///   broadcast channels without serialization.
 /// - Each event type gets its own dedicated broadcast channel.
+/// - Pattern subscriptions use a global channel that receives all published events.
 ///
 /// # Thread Safety
 ///
-/// The bus is internally wrapped in `Arc<RwLock<...>>`, making it safe to
-/// share across tasks. It implements `Clone` (cheap reference clone) and
-/// `Send + Sync`.
+/// Channel bookkeeping uses `std::sync::RwLock` for fast, non-blocking
+/// HashMap lookups on the hot path. The bus is wrapped in `Arc`, making it
+/// safe to share across tasks. It implements `Clone` (cheap reference clone)
+/// and `Send + Sync`.
 ///
 /// # Example
 ///
 /// ```ignore
 /// use anycms_event::prelude::*;
 ///
-/// #[derive(Clone, Debug, Serialize, Deserialize)]
+/// #[derive(Clone, Debug)]
 /// struct UserCreated { name: String }
 ///
 /// impl Event for UserCreated {
@@ -63,67 +94,141 @@ pub struct Subscription {
 /// bus.publish(UserCreated { name: "Alice".into() }).await?;
 /// ```
 pub struct EventBus {
-    inner: Arc<RwLock<EventBusInner>>,
+    inner: Arc<EventBusInner>,
 }
 
 struct EventBusInner {
     /// Broadcast channels keyed by event name.
-    channels: HashMap<String, broadcast::Sender<String>>,
+    channels: RwLock<HashMap<String, broadcast::Sender<ErasedEvent>>>,
+    /// Global channel: every published event is also sent here.
+    /// Pattern subscribers listen on this channel and filter with `topic::matches`.
+    global_channel: broadcast::Sender<GlobalEvent>,
     /// Registered topic patterns and the event names they match.
-    topic_patterns: HashMap<String, Vec<String>>,
+    topic_patterns: RwLock<HashMap<String, Vec<String>>>,
     /// Monotonically increasing subscription ID counter.
-    next_sub_id: usize,
+    next_sub_id: AtomicUsize,
+    /// Capacity for new broadcast channels.
+    capacity: usize,
 }
 
 impl EventBus {
-    /// Create a new, empty event bus.
+    /// Create a new event bus with the default channel capacity (1024).
     pub fn new() -> Self {
+        Self::with_capacity(1024)
+    }
+
+    /// Create a new event bus with the specified broadcast channel capacity.
+    ///
+    /// The capacity controls how many messages can be buffered before slow
+    /// subscribers start being lagged (dropping old messages).
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (global_tx, _) = broadcast::channel(capacity);
         Self {
-            inner: Arc::new(RwLock::new(EventBusInner {
-                channels: HashMap::new(),
-                topic_patterns: HashMap::new(),
-                next_sub_id: 0,
-            })),
+            inner: Arc::new(EventBusInner {
+                channels: RwLock::new(HashMap::new()),
+                global_channel: global_tx,
+                topic_patterns: RwLock::new(HashMap::new()),
+                next_sub_id: AtomicUsize::new(0),
+                capacity,
+            }),
         }
     }
 
     /// Get or create a broadcast channel for the given event type.
-    async fn get_or_create_channel<E: Event>(&self) -> broadcast::Sender<String> {
-        let mut inner = self.inner.write().await;
-        inner
-            .channels
+    ///
+    /// Uses a read-lock fast path: if the channel already exists, it is
+    /// returned without acquiring a write lock. The slow path upgrades to
+    /// a write lock with a double-check to avoid racing with other writers.
+    fn get_or_create_channel<E: Event>(&self) -> broadcast::Sender<ErasedEvent> {
+        // Fast path: read lock
+        {
+            let channels = self.inner.channels.read().unwrap();
+            if let Some(sender) = channels.get(E::event_name()) {
+                return sender.clone();
+            }
+        }
+        // Slow path: write lock (double-check pattern)
+        let mut channels = self.inner.channels.write().unwrap();
+        channels
             .entry(E::event_name().to_string())
-            .or_insert_with(|| broadcast::channel(DEFAULT_CHANNEL_CAPACITY).0)
+            .or_insert_with(|| broadcast::channel(self.inner.capacity).0)
             .clone()
     }
 
     /// Publish a typed event to the bus.
     ///
-    /// The event is serialized to JSON and sent through the broadcast channel
-    /// associated with its event type. If there are no subscribers, the publish
-    /// is a no-op (not an error).
+    /// The event is type-erased via `Arc<dyn Any + Send + Sync>` and sent
+    /// through the broadcast channel associated with its event type. If there
+    /// are no subscribers, the publish is a no-op (not an error).
+    ///
+    /// The event is also sent to the global channel for pattern subscribers.
     ///
     /// # Errors
     ///
-    /// Returns [`EventBusError::PublishFailed`] if serialization fails or the
-    /// channel returns an unexpected error.
+    /// Returns [`EventBusError::PublishFailed`] if the channel returns an
+    /// unexpected error.
     pub async fn publish<E: Event>(&self, event: E) -> Result<()> {
-        let sender = self.get_or_create_channel::<E>().await;
-        let payload = serde_json::to_string(&event)
-            .map_err(|e| EventBusError::PublishFailed(e.to_string()))?;
+        // Fast path: check if channel exists with read lock
+        let sender = {
+            let channels = self.inner.channels.read().unwrap();
+            match channels.get(E::event_name()) {
+                Some(sender) if sender.receiver_count() > 0 => Some(sender.clone()),
+                Some(_) => {
+                    // Channel exists but no subscribers
+                    tracing::debug!(
+                        event = E::event_name(),
+                        receivers = 0,
+                        "Event published (no subscribers)"
+                    );
+                    // Still send to global channel below
+                    None
+                }
+                None => {
+                    // Channel doesn't exist, no subscribers ever registered
+                    tracing::debug!(
+                        event = E::event_name(),
+                        receivers = 0,
+                        "Event published (no channel)"
+                    );
+                    // Still send to global channel below
+                    None
+                }
+            }
+        };
 
-        let receiver_count = sender.receiver_count();
-        if receiver_count > 0 {
+        if let Some(sender) = sender {
+            // Type-erase the event
+            let payload: ErasedEvent = Arc::new(event.clone());
+            let receiver_count = sender.receiver_count();
+
             sender
                 .send(payload)
-                .map_err(|e| EventBusError::PublishFailed(e.to_string()))?;
+                .map_err(|e| EventBusError::PublishFailed {
+                    event_name: E::event_name(),
+                    reason: PublishErrorReason::ChannelError(e.to_string()),
+                })?;
+
+            tracing::debug!(
+                event = E::event_name(),
+                receivers = receiver_count,
+                "Event published"
+            );
+
+            // Also publish to the global channel for pattern subscribers
+            let global_event = GlobalEvent {
+                event_name: E::event_name().to_string(),
+                payload: Arc::new(event) as ErasedEvent,
+            };
+            let _ = self.inner.global_channel.send(global_event);
+        } else {
+            // No per-event-type subscribers, but still publish to global channel
+            let global_event = GlobalEvent {
+                event_name: E::event_name().to_string(),
+                payload: Arc::new(event) as ErasedEvent,
+            };
+            let _ = self.inner.global_channel.send(global_event);
         }
 
-        tracing::debug!(
-            event = E::event_name(),
-            receivers = receiver_count,
-            "Event published"
-        );
         Ok(())
     }
 
@@ -142,33 +247,27 @@ impl EventBus {
     /// # Returns
     ///
     /// A [`Subscription`] handle with the event name and a unique ID.
+    /// The subscription can be used to unsubscribe via [`Subscription::unsubscribe`].
     pub async fn subscribe<E, F, Fut>(&self, handler: F) -> Result<Subscription>
     where
         E: Event,
         F: Fn(E) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
-        let sender = self.get_or_create_channel::<E>().await;
+        let sender = self.get_or_create_channel::<E>();
         let mut rx = sender.subscribe();
 
         let event_name = E::event_name().to_string();
-
-        // Allocate a unique subscription ID
-        let id = {
-            let mut guard = self.inner.write().await;
-            let id = guard.next_sub_id;
-            guard.next_sub_id += 1;
-            id
-        };
+        let id = self.inner.next_sub_id.fetch_add(1, Ordering::Relaxed);
 
         let handler_event_name = event_name.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(payload) => {
-                        match serde_json::from_str::<E>(&payload) {
-                            Ok(event) => {
-                                if let Err(e) = handler(event).await {
+                        match payload.downcast_ref::<E>() {
+                            Some(event) => {
+                                if let Err(e) = handler(event.clone()).await {
                                     tracing::error!(
                                         event = %handler_event_name,
                                         error = %e,
@@ -176,11 +275,10 @@ impl EventBus {
                                     );
                                 }
                             }
-                            Err(e) => {
+                            None => {
                                 tracing::error!(
                                     event = %handler_event_name,
-                                    error = %e,
-                                    "Failed to deserialize event"
+                                    "Failed to downcast event"
                                 );
                             }
                         }
@@ -203,7 +301,13 @@ impl EventBus {
             }
         });
 
-        Ok(Subscription { event_name, id })
+        let abort_handle = handle.abort_handle();
+
+        Ok(Subscription {
+            event_name,
+            id,
+            abort_handle,
+        })
     }
 
     /// Subscribe to a topic pattern with wildcard support.
@@ -213,9 +317,9 @@ impl EventBus {
     /// - `**` matches multiple segments (e.g., `"user.**"` matches `"user.foo.bar"`)
     /// - Exact match when no wildcards are present
     ///
-    /// This method registers the pattern and subscribes the handler to the
-    /// event type `E`. For true pattern-based routing, use this in combination
-    /// with an event type whose `topic()` matches the pattern.
+    /// Pattern subscribers listen on the global channel and filter events
+    /// using [`crate::topic::matches`]. This allows a single subscriber to
+    /// receive events of different types that share a topic namespace.
     pub async fn subscribe_pattern<E, F, Fut>(
         &self,
         pattern: &str,
@@ -226,17 +330,80 @@ impl EventBus {
         F: Fn(E) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
-        // Register the pattern
+        // Register the pattern for bookkeeping
         {
-            let mut inner = self.inner.write().await;
-            inner
-                .topic_patterns
+            let mut patterns = self.inner.topic_patterns.write().unwrap();
+            patterns
                 .entry(pattern.to_string())
                 .or_default()
                 .push(E::event_name().to_string());
         }
 
-        self.subscribe::<E, F, Fut>(handler).await
+        let mut rx = self.inner.global_channel.subscribe();
+        let event_name = E::event_name().to_string();
+        let id = self.inner.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        let pattern_owned = pattern.to_string();
+        let handler_event_name = event_name.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(global_event) => {
+                        // Filter: only process if pattern matches
+                        if !crate::topic::matches(&pattern_owned, &global_event.event_name) {
+                            continue;
+                        }
+                        match global_event.payload.downcast_ref::<E>() {
+                            Some(event) => {
+                                if let Err(e) = handler(event.clone()).await {
+                                    tracing::error!(
+                                        event = %handler_event_name,
+                                        pattern = %pattern_owned,
+                                        error = %e,
+                                        "Pattern handler error"
+                                    );
+                                }
+                            }
+                            None => {
+                                // Event matched the pattern name but is a different type.
+                                // This is expected when multiple event types share a topic.
+                                // Just skip it — another subscriber with the correct type will handle it.
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            pattern = %pattern_owned,
+                            lagged = n,
+                            "Pattern subscriber lagged behind"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::debug!(
+                            pattern = %pattern_owned,
+                            "Global channel closed, stopping pattern subscriber"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+
+        let abort_handle = handle.abort_handle();
+
+        Ok(Subscription {
+            event_name,
+            id,
+            abort_handle,
+        })
+    }
+
+    /// Shut down the event bus by clearing all channels.
+    ///
+    /// All active subscriber tasks will receive `Closed` errors and exit.
+    /// This is useful for graceful shutdown during application termination.
+    pub fn shutdown(&self) {
+        self.inner.channels.write().unwrap().clear();
     }
 }
 
@@ -254,5 +421,5 @@ impl Clone for EventBus {
     }
 }
 
-// Note: EventBus is Send + Sync because Arc<RwLock<...>> is Send + Sync.
-// This is guaranteed by the standard library types used in the implementation.
+// Note: EventBus is Send + Sync because Arc<EventBusInner> is Send + Sync.
+// EventBusInner is Sync because RwLock<HashMap<...>> and AtomicUsize are Sync.

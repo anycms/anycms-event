@@ -11,11 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 use anycms_event::prelude::*;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct DataImported {
     record_count: usize,
     success: bool,
@@ -59,7 +57,10 @@ async fn main() {
             // 模拟：第 2 次和第 4 次失败
             if n == 2 || n == 4 {
                 println!("❌ [数据分析] 第 {} 次处理失败！模拟错误", n);
-                return Err(EventBusError::SubscriberError("数据格式异常".into()));
+                return Err(EventBusError::HandlerError {
+                    event_name: "data.imported".into(),
+                    message: "数据格式异常".into(),
+                });
             }
 
             let ok = uc.fetch_add(1, Ordering::SeqCst) + 1;

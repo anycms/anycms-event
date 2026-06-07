@@ -19,8 +19,8 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 futures-util = "0.3"
-anycms-event-derive = { version = "0.1.1", path = "crates/anycms-event-derive" }
-anycms-event = { version = "0.1.1", path = "." }
+anycms-event-derive = { version = "0.1.1", path = "crates/anycms-event-derive", registry = "r404" }
+anycms-event = { version = "0.1.1", path = ".", registry = "r404" }
 
 # ── anycms-event (core) ──────────────────────────────────────
 
