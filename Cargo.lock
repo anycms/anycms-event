@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "actix-web",
  "anycms-event-derive",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event-derive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event-redis"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anycms-event",
  "futures-util",

@@ -7,7 +7,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT"
 homepage = "https://anycms.org"
 edition = "2024"
@@ -19,8 +19,8 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 futures-util = "0.3"
-anycms-event-derive = { version = "0.1.0", path = "crates/anycms-event-derive" }
-anycms-event = { version = "0.1.0", path = "." }
+anycms-event-derive = { version = "0.1.1", path = "crates/anycms-event-derive" }
+anycms-event = { version = "0.1.1", path = "." }
 
 # ── anycms-event (core) ──────────────────────────────────────
 
