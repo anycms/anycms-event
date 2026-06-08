@@ -1,3 +1,10 @@
+## [0.1.4] - 2026-06-08
+
+### 🚀 Features
+
+- Add Event Registry, Execution Log, and Trigger Rule Engine for system management
+- Add retry/dead-letter, rule storage, shutdown, transport trait
+- Comprehensive event bus improvements (6 tasks)
 ## [0.1.3] - 2026-06-07
 
 ### 🚀 Features
@@ -11,6 +18,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Add new crates to justfile publish task
+- Release
 ## [0.1.2] - 2026-06-07
 
 ### 🚜 Refactor
