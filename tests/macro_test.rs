@@ -222,3 +222,69 @@ async fn test_event_bus_clone() {
 
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
+
+// ── Test to_json and from_json ────────────────────────────────────────
+
+#[test]
+fn test_to_json_from_json_derive_event() {
+    let event = ManualEvent { value: 42 };
+
+    // Test to_json
+    let json_value = event.to_json().expect("to_json should succeed");
+    assert_eq!(json_value["value"], 42);
+
+    // Test from_json
+    let json_str = r#"{"value": 99}"#;
+    let deserialized: ManualEvent = ManualEvent::from_json(json_str).expect("from_json should succeed");
+    assert_eq!(deserialized.value, 99);
+
+    // Test from_json with invalid JSON
+    let invalid_json = r#"{"value": "not a number"}"#;
+    let result: Option<ManualEvent> = ManualEvent::from_json(invalid_json);
+    assert!(result.is_none(), "from_json should return None for invalid JSON");
+}
+
+#[test]
+fn test_to_json_from_json_event_bus_macro() {
+    let event = UserCreated {
+        user_id: 123,
+        username: "alice".into(),
+    };
+
+    // Test to_json
+    let json_value = event.to_json().expect("to_json should succeed");
+    assert_eq!(json_value["user_id"], 123);
+    assert_eq!(json_value["username"], "alice");
+
+    // Test from_json
+    let json_str = r#"{"user_id": 456, "username": "bob"}"#;
+    let deserialized: UserCreated = UserCreated::from_json(json_str).expect("from_json should succeed");
+    assert_eq!(deserialized.user_id, 456);
+    assert_eq!(deserialized.username, "bob");
+
+    // Test from_json with invalid JSON
+    let invalid_json = r#"{"user_id": "not a number", "username": "test"}"#;
+    let result: Option<UserCreated> = UserCreated::from_json(invalid_json);
+    assert!(result.is_none(), "from_json should return None for invalid JSON");
+}
+
+#[test]
+fn test_to_json_from_json_auto_name_event() {
+    let event = AutoNameEvent {
+        data: "test data".into(),
+    };
+
+    // Test to_json
+    let json_value = event.to_json().expect("to_json should succeed");
+    assert_eq!(json_value["data"], "test data");
+
+    // Test from_json
+    let json_str = r#"{"data": "deserialized data"}"#;
+    let deserialized: AutoNameEvent = AutoNameEvent::from_json(json_str).expect("from_json should succeed");
+    assert_eq!(deserialized.data, "deserialized data");
+
+    // Test from_json with invalid JSON
+    let invalid_json = r#"{"invalid_field": "test"}"#;
+    let result: Option<AutoNameEvent> = AutoNameEvent::from_json(invalid_json);
+    assert!(result.is_none(), "from_json should return None for invalid JSON");
+}

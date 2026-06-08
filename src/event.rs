@@ -47,4 +47,17 @@ pub trait Event: Clone + Send + Sync + 'static {
         let _ = self;
         None
     }
+
+    /// Deserialize event from a JSON string.
+    ///
+    /// Default returns `None` — events that implement `Deserialize` can override
+    /// to provide deserialization. The `#[derive(Event)]` macro auto-generates
+    /// this using `serde_json::from_str`.
+    fn from_json(json: &str) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        let _ = json;
+        None
+    }
 }

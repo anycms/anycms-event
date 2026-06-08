@@ -23,9 +23,32 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// Type alias for the boxed future returned by Transport methods.
 pub type TransportFuture<'a> = Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + 'a>>;
+
+/// A message received from the transport layer.
+#[derive(Debug, Clone)]
+pub struct TransportMessage {
+    /// Event name / type identifier.
+    pub event_name: String,
+    /// Serialized event payload (JSON string).
+    pub payload: String,
+}
+
+/// Callback invoked when a message is received from the transport.
+pub type TransportMessageCallback = Arc<dyn Fn(TransportMessage) + Send + Sync>;
+
+/// Handle to an active subscription on a transport backend.
+///
+/// Implement this to provide lifecycle control over subscriptions.
+pub trait TransportSubscription: Send + Sync {
+    /// Stop receiving messages and clean up resources.
+    fn stop(&self);
+    /// Check if the subscription is still active.
+    fn is_active(&self) -> bool;
+}
 
 /// Error type for transport operations.
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +85,16 @@ pub trait Transport: Send + Sync {
     /// * `payload` - Pre-serialized JSON string of the event
     fn publish(&self, event_name: &str, payload: &str) -> TransportFuture<'_>;
 
+    /// Subscribe to events matching `event_pattern` from the transport.
+    ///
+    /// The `callback` is invoked for each received message. Returns a
+    /// [`TransportSubscription`] handle for lifecycle control.
+    fn subscribe(
+        &self,
+        event_pattern: &str,
+        callback: TransportMessageCallback,
+    ) -> Result<Box<dyn TransportSubscription>, TransportError>;
+
     /// Clone this transport into a boxed trait object.
     ///
     /// Required because trait objects cannot implement `Clone` directly.
@@ -83,5 +116,11 @@ pub trait ForwarderHandle: Send + Sync {
 impl Debug for Box<dyn Transport> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Transport").finish()
+    }
+}
+
+impl Debug for Box<dyn TransportSubscription> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportSubscription").finish()
     }
 }

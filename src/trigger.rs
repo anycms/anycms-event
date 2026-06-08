@@ -51,6 +51,41 @@ use serde::{Deserialize, Serialize};
 use crate::bus::EventBus;
 use crate::error::Result;
 
+// ── ConditionLimits ─────────────────────────────────────────────────
+
+/// Safety limits for condition evaluation in the trigger rule engine.
+///
+/// These limits prevent DoS attacks via maliciously crafted conditions
+/// (e.g., deeply nested JSON paths, excessive operators, or huge strings).
+#[derive(Clone, Debug)]
+pub struct ConditionLimits {
+    /// Maximum path depth for `json_path_get()`.
+    ///
+    /// Paths with more segments than this are rejected.
+    /// Default: 10.
+    pub max_path_depth: usize,
+    /// Maximum number of operators per condition object.
+    ///
+    /// Conditions with more operators than this are rejected.
+    /// Default: 20.
+    pub max_operators: usize,
+    /// Maximum string length (in bytes) for `$contains` operations.
+    ///
+    /// Strings longer than this are rejected.
+    /// Default: 10_000 (10 KB).
+    pub max_string_length: usize,
+}
+
+impl Default for ConditionLimits {
+    fn default() -> Self {
+        Self {
+            max_path_depth: 10,
+            max_operators: 20,
+            max_string_length: 10_000,
+        }
+    }
+}
+
 // ── TriggerContext ────────────────────────────────────────────────
 
 /// 触发动作的上下文数据。
@@ -229,6 +264,8 @@ struct TriggerEngineState {
     storage: Arc<dyn RuleStorage>,
     actions: RwLock<HashMap<String, TriggerActionFn>>,
     running: AtomicBool,
+    /// Safety limits for condition evaluation.
+    limits: ConditionLimits,
 }
 
 // ── TriggerRuleEngine ─────────────────────────────────────────────
@@ -247,6 +284,8 @@ struct TriggerEngineState {
 pub struct TriggerRuleEngine {
     bus: EventBus,
     state: Arc<TriggerEngineState>,
+    /// Safety limits for condition evaluation.
+    limits: ConditionLimits,
 }
 
 impl TriggerRuleEngine {
@@ -261,7 +300,9 @@ impl TriggerRuleEngine {
                 storage: Arc::new(InMemoryRuleStorage::new()),
                 actions: RwLock::new(HashMap::new()),
                 running: AtomicBool::new(false),
+                limits: ConditionLimits::default(),
             }),
+            limits: ConditionLimits::default(),
         }
     }
 
@@ -275,7 +316,41 @@ impl TriggerRuleEngine {
                 storage,
                 actions: RwLock::new(HashMap::new()),
                 running: AtomicBool::new(false),
+                limits: ConditionLimits::default(),
             }),
+            limits: ConditionLimits::default(),
+        }
+    }
+
+    /// Create a new engine with custom condition evaluation limits.
+    pub fn with_limits(bus: EventBus, limits: ConditionLimits) -> Self {
+        Self {
+            bus,
+            state: Arc::new(TriggerEngineState {
+                storage: Arc::new(InMemoryRuleStorage::new()),
+                actions: RwLock::new(HashMap::new()),
+                running: AtomicBool::new(false),
+                limits: limits.clone(),
+            }),
+            limits,
+        }
+    }
+
+    /// Create a new engine with custom storage and condition evaluation limits.
+    pub fn with_storage_and_limits(
+        bus: EventBus,
+        storage: Arc<dyn RuleStorage>,
+        limits: ConditionLimits,
+    ) -> Self {
+        Self {
+            bus,
+            state: Arc::new(TriggerEngineState {
+                storage,
+                actions: RwLock::new(HashMap::new()),
+                running: AtomicBool::new(false),
+                limits: limits.clone(),
+            }),
+            limits,
         }
     }
 
@@ -367,6 +442,11 @@ impl TriggerRuleEngine {
         self.state.storage.count()
     }
 
+    /// 获取当前的条件评估限制配置。
+    pub fn limits(&self) -> &ConditionLimits {
+        &self.limits
+    }
+
     /// 列出已注册的 action 类型。
     pub fn list_action_types(&self) -> Vec<String> {
         self.state.actions.read().unwrap().keys().cloned().collect()
@@ -454,7 +534,7 @@ impl TriggerRuleEngine {
 
             // 检查条件过滤
             if let Some(ref condition) = rule.condition {
-                if !matches_condition(event_data, condition) {
+                if !matches_condition(event_data, condition, &state.limits) {
                     continue;
                 }
             }
@@ -528,18 +608,30 @@ impl crate::event::Event for TriggerEvent {
 /// - `$lte` 小于等于
 /// - `$in` 包含在列表中
 /// - `$contains` 字符串包含
-fn matches_condition(data: &serde_json::Value, condition: &serde_json::Value) -> bool {
+fn matches_condition(
+    data: &serde_json::Value,
+    condition: &serde_json::Value,
+    limits: &ConditionLimits,
+) -> bool {
     let Some(condition_obj) = condition.as_object() else {
         return true;
     };
 
+    let mut operator_count = 0;
+
     for (field, ops) in condition_obj {
-        let value = json_path_get(data, field);
+        let value = json_path_get(data, field, limits.max_path_depth);
         let Some(value) = value else {
             return false;
         };
 
-        if !match_operators(value, ops) {
+        if !match_operators(
+            value,
+            ops,
+            &mut operator_count,
+            limits.max_operators,
+            limits.max_string_length,
+        ) {
             return false;
         }
     }
@@ -548,22 +640,56 @@ fn matches_condition(data: &serde_json::Value, condition: &serde_json::Value) ->
 }
 
 /// 通过点分路径获取 JSON 值。
-fn json_path_get<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+fn json_path_get<'a>(
+    data: &'a serde_json::Value,
+    path: &str,
+    max_depth: usize,
+) -> Option<&'a serde_json::Value> {
     let mut current = data;
+    let mut depth = 0;
+
     for segment in path.split('.') {
+        if depth >= max_depth {
+            tracing::warn!(
+                path = %path,
+                depth = depth,
+                max = max_depth,
+                "json_path_get exceeded maximum depth, rejecting"
+            );
+            return None;
+        }
         current = current.get(segment)?;
+        depth += 1;
     }
+
     Some(current)
 }
 
 /// 对一个值执行操作符匹配。
-fn match_operators(value: &serde_json::Value, ops: &serde_json::Value) -> bool {
+fn match_operators(
+    value: &serde_json::Value,
+    ops: &serde_json::Value,
+    operator_count: &mut usize,
+    max_operators: usize,
+    max_string_length: usize,
+) -> bool {
     let Some(ops_obj) = ops.as_object() else {
         // 如果 ops 不是对象，则作为精确匹配
         return value == ops;
     };
 
     for (op, expected) in ops_obj {
+        *operator_count += 1;
+
+        if *operator_count > max_operators {
+            tracing::warn!(
+                count = *operator_count,
+                max = max_operators,
+                "Condition exceeded maximum operator count, rejecting"
+            );
+            return false;
+        }
+
         match op.as_str() {
             "$eq" => {
                 if value != expected {
@@ -607,6 +733,15 @@ fn match_operators(value: &serde_json::Value, ops: &serde_json::Value) -> bool {
                 let (Some(s), Some(pattern)) = (value.as_str(), expected.as_str()) else {
                     return false;
                 };
+                if s.len() > max_string_length || pattern.len() > max_string_length {
+                    tracing::warn!(
+                        s_len = s.len(),
+                        p_len = pattern.len(),
+                        max = max_string_length,
+                        "$contains string exceeded length limit, rejecting"
+                    );
+                    return false;
+                }
                 if !s.contains(pattern) {
                     return false;
                 }
@@ -787,67 +922,140 @@ mod tests {
     fn test_condition_eq() {
         let data = serde_json::json!({"status": "published", "level": 3});
         let condition = serde_json::json!({"status": {"$eq": "published"}});
-        assert!(matches_condition(&data, &condition));
+        assert!(matches_condition(&data, &condition, &ConditionLimits::default()));
 
         let condition = serde_json::json!({"status": {"$eq": "draft"}});
-        assert!(!matches_condition(&data, &condition));
+        assert!(!matches_condition(&data, &condition, &ConditionLimits::default()));
     }
 
     #[test]
     fn test_condition_ne() {
         let data = serde_json::json!({"status": "published"});
         let condition = serde_json::json!({"status": {"$ne": "draft"}});
-        assert!(matches_condition(&data, &condition));
+        assert!(matches_condition(&data, &condition, &ConditionLimits::default()));
     }
 
     #[test]
     fn test_condition_gt_lt() {
         let data = serde_json::json!({"amount": 500});
         let condition = serde_json::json!({"amount": {"$gt": 100, "$lt": 1000}});
-        assert!(matches_condition(&data, &condition));
+        assert!(matches_condition(&data, &condition, &ConditionLimits::default()));
 
         let data = serde_json::json!({"amount": 50});
-        assert!(!matches_condition(&data, &condition));
+        assert!(!matches_condition(&data, &condition, &ConditionLimits::default()));
     }
 
     #[test]
     fn test_condition_in() {
         let data = serde_json::json!({"category": "books"});
         let condition = serde_json::json!({"category": {"$in": ["books", "electronics"]}});
-        assert!(matches_condition(&data, &condition));
+        assert!(matches_condition(&data, &condition, &ConditionLimits::default()));
 
         let data = serde_json::json!({"category": "clothing"});
-        assert!(!matches_condition(&data, &condition));
+        assert!(!matches_condition(&data, &condition, &ConditionLimits::default()));
     }
 
     #[test]
     fn test_condition_contains() {
         let data = serde_json::json!({"title": "Hello World Article"});
         let condition = serde_json::json!({"title": {"$contains": "World"}});
-        assert!(matches_condition(&data, &condition));
+        assert!(matches_condition(&data, &condition, &ConditionLimits::default()));
 
         let condition = serde_json::json!({"title": {"$contains": "Missing"}});
-        assert!(!matches_condition(&data, &condition));
+        assert!(!matches_condition(&data, &condition, &ConditionLimits::default()));
     }
 
     #[test]
     fn test_condition_nested_path() {
         let data = serde_json::json!({"user": {"level": 5}});
         let condition = serde_json::json!({"user.level": {"$gte": 3}});
-        assert!(matches_condition(&data, &condition));
+        assert!(matches_condition(&data, &condition, &ConditionLimits::default()));
     }
 
     #[test]
     fn test_condition_missing_field() {
         let data = serde_json::json!({"status": "ok"});
         let condition = serde_json::json!({"missing_field": {"$eq": "value"}});
-        assert!(!matches_condition(&data, &condition));
+        assert!(!matches_condition(&data, &condition, &ConditionLimits::default()));
     }
 
     #[test]
     fn test_condition_no_condition() {
         let data = serde_json::json!({"status": "ok"});
-        assert!(matches_condition(&data, &serde_json::Value::Null));
+        assert!(matches_condition(&data, &serde_json::Value::Null, &ConditionLimits::default()));
+    }
+
+    #[test]
+    fn test_condition_limits_path_depth() {
+        let data = serde_json::json!({"a": {"b": {"c": {"d": {"e": "deep"}}}}});
+
+        // Path with 5 segments should work with default limits (max_depth=10)
+        let limits = ConditionLimits::default();
+        assert!(matches_condition(
+            &data,
+            &serde_json::json!({"a.b.c.d.e": {"$eq": "deep"}}),
+            &limits
+        ));
+
+        // Path with max_depth=2 should reject a 5-segment path
+        let strict_limits = ConditionLimits {
+            max_path_depth: 2,
+            ..Default::default()
+        };
+        assert!(!matches_condition(
+            &data,
+            &serde_json::json!({"a.b.c.d.e": {"$eq": "deep"}}),
+            &strict_limits
+        ));
+    }
+
+    #[test]
+    fn test_condition_limits_operator_count() {
+        let data = serde_json::json!({"value": 42});
+
+        // 3 operators should work with default limits (max_operators=20)
+        let limits = ConditionLimits::default();
+        assert!(matches_condition(
+            &data,
+            &serde_json::json!({"value": {"$gt": 0, "$lt": 100, "$ne": 50}}),
+            &limits
+        ));
+
+        // 3 operators should fail with max_operators=2
+        let strict_limits = ConditionLimits {
+            max_operators: 2,
+            ..Default::default()
+        };
+        assert!(!matches_condition(
+            &data,
+            &serde_json::json!({"value": {"$gt": 0, "$lt": 100, "$ne": 50}}),
+            &strict_limits
+        ));
+    }
+
+    #[test]
+    fn test_condition_limits_string_length() {
+        let long_string = "a".repeat(20_000);
+        let data = serde_json::json!({"text": long_string});
+
+        // Default limits should reject strings > 10,000 chars
+        let limits = ConditionLimits::default();
+        assert!(!matches_condition(
+            &data,
+            &serde_json::json!({"text": {"$contains": "a"}}),
+            &limits
+        ));
+
+        // Relaxed limits should allow it
+        let relaxed_limits = ConditionLimits {
+            max_string_length: 100_000,
+            ..Default::default()
+        };
+        assert!(matches_condition(
+            &data,
+            &serde_json::json!({"text": {"$contains": "a"}}),
+            &relaxed_limits
+        ));
     }
 
     // ── process_event tests ──────────────────────────────────

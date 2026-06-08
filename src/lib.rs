@@ -41,6 +41,9 @@ pub mod execution_log;
 pub mod trigger;
 pub mod transport;
 
+#[cfg(feature = "prometheus")]
+pub mod telemetry_metrics;
+
 pub mod prelude;
 
 // Re-export main types at crate root
@@ -48,6 +51,9 @@ pub use error::{EventBusError, Result};
 pub use event::Event;
 pub use bus::EventBus;
 pub use trigger::RuleStorage;
+
+#[cfg(feature = "prometheus")]
+pub use telemetry_metrics::MetricsTelemetry;
 
 #[cfg(feature = "testing")]
 pub mod testing;

@@ -1,34 +1,30 @@
-//! Actix-web integration helpers for anycms-event.
+//! Actix-web integration for anycms-event.
 //!
-//! 提供将 EventBus 集成到 Actix-web 的便捷方法。
+//! Provides state management, extractors, and optional SSE endpoint support.
 //!
-//! Actix-web 的 `web::Data<T>` 已经处理了 `Arc` 包装，
-//! 因此集成模式非常简洁：
+//! # Quick Start
 //!
 //! ```ignore
-//! use actix_web::{web, App, HttpServer};
-//! use anycms_event_actix::HasEventBus;
+//! use anycms_event::EventBus;
+//! use anycms_event_actix::{init_event_bus, EventBusExtractor};
 //!
-//! // 注册
+//! let bus = EventBus::new();
+//! let data = init_event_bus(bus);
+//!
 //! HttpServer::new(move || {
 //!     App::new()
-//!         .app_data(web::Data::new(bus.clone()))
+//!         .app_data(data.clone())
+//!         .route("/events", web::get().to(events_handler))
 //! })
-//!
-//! // Handler 中使用
-//! async fn create_user(bus: web::Data<AppEventBus>) -> impl Responder {
-//!     bus.publish(UserCreated { ... }).await.unwrap();
-//!     HttpResponse::Created().finish()
-//! }
 //! ```
 
-use anycms_event::EventBus;
+mod state;
+mod extractor;
+mod trait_def;
 
-/// Trait for types that expose an inner [`EventBus`].
-///
-/// The `event_bus!` macro generates an `inner()` method that returns `&EventBus`.
-/// Implement this trait to enable framework integration.
-pub trait HasEventBus {
-    /// 返回内部 EventBus 引用。
-    fn event_bus(&self) -> &EventBus;
-}
+pub use state::init_event_bus;
+pub use extractor::EventBusExtractor;
+pub use trait_def::HasEventBus;
+
+#[cfg(feature = "sse")]
+pub mod sse;

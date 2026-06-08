@@ -219,6 +219,17 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
             fn topic() -> &'static str {
                 #topic
             }
+
+            fn to_json(&self) -> Option<::serde_json::Value> {
+                ::serde_json::to_value(self).ok()
+            }
+
+            fn from_json(json: &str) -> Option<Self>
+            where
+                Self: Sized,
+            {
+                ::serde_json::from_str(json).ok()
+            }
         }
     };
 
@@ -404,6 +415,17 @@ pub fn event_bus(input: TokenStream) -> TokenStream {
 
                     fn topic() -> &'static str {
                         #topic_str
+                    }
+
+                    fn to_json(&self) -> Option<::serde_json::Value> {
+                        ::serde_json::to_value(self).ok()
+                    }
+
+                    fn from_json(json: &str) -> Option<Self>
+                    where
+                        Self: Sized,
+                    {
+                        ::serde_json::from_str(json).ok()
                     }
                 }
             }

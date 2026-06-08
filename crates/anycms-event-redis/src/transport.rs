@@ -63,6 +63,25 @@ pub struct ForwarderHandle {
     handle: JoinHandle<()>,
 }
 
+// ----------------------------------------------------------------------------
+// TransportSubscription
+// ----------------------------------------------------------------------------
+
+/// Subscription handle for a Redis transport subscription.
+pub struct RedisTransportSubscription {
+    abort_handle: tokio::task::AbortHandle,
+}
+
+impl anycms_event::transport::TransportSubscription for RedisTransportSubscription {
+    fn stop(&self) {
+        self.abort_handle.abort();
+    }
+
+    fn is_active(&self) -> bool {
+        !self.abort_handle.is_finished()
+    }
+}
+
 impl ForwarderHandle {
     /// Gracefully stop the forwarder task by aborting it.
     ///
@@ -376,6 +395,68 @@ impl RedisTransport {
         Ok(())
     }
 
+    /// Inner loop for the generic forwarder: subscribes and processes messages
+    /// until the connection drops.
+    ///
+    /// Incoming messages are expected to be [`RedisMessage`] envelopes.
+    /// Messages whose `source_id` matches our own are silently skipped
+    /// (echo prevention).
+    ///
+    /// This is similar to `run_forwarder` but uses a callback instead of
+    /// generics, making it suitable for the trait's `subscribe` method.
+    async fn run_generic_forwarder(
+        client: &redis::Client,
+        channel: &str,
+        source_id: &str,
+        callback: &anycms_event::transport::TransportMessageCallback,
+    ) -> std::result::Result<(), RedisTransportError> {
+        let mut pubsub = client
+            .get_async_pubsub()
+            .await
+            .map_err(|e| RedisTransportError::SubscribeError(e.to_string()))?;
+
+        pubsub
+            .subscribe(channel)
+            .await
+            .map_err(|e| RedisTransportError::SubscribeError(e.to_string()))?;
+
+        tracing::info!(channel = %channel, "Subscribed to Redis channel (generic forwarder)");
+
+        let mut stream = pubsub.on_message();
+
+        while let Some(msg) = stream.next().await {
+            let raw: String = msg
+                .get_payload()
+                .map_err(|e| RedisTransportError::SubscribeError(e.to_string()))?;
+
+            let envelope: RedisMessage = match serde_json::from_str(&raw) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to parse Redis message envelope");
+                    continue;
+                }
+            };
+
+            // Echo prevention
+            if envelope.source_id == source_id {
+                continue;
+            }
+
+            // Extract event name from channel
+            let event_name = channel
+                .strip_prefix(DEFAULT_CHANNEL_PREFIX)
+                .unwrap_or(channel)
+                .to_string();
+
+            callback(anycms_event::transport::TransportMessage {
+                event_name,
+                payload: envelope.payload,
+            });
+        }
+
+        Ok(())
+    }
+
     /// Create a bidirectional bridge between this Redis transport and a local
     /// [`EventBus`].
     ///
@@ -567,6 +648,40 @@ impl anycms_event::transport::Transport for RedisTransport {
                 .await
                 .map_err(|e| anycms_event::transport::TransportError::Publish(e.to_string()))
         })
+    }
+
+    fn subscribe(
+        &self,
+        event_pattern: &str,
+        callback: anycms_event::transport::TransportMessageCallback,
+    ) -> std::result::Result<Box<dyn anycms_event::transport::TransportSubscription>, anycms_event::transport::TransportError> {
+        let channel = self.channel_name(event_pattern);
+        let client = self.client.clone();
+        let source_id = generate_source_id();
+
+        let handle = tokio::spawn(async move {
+            let base_delay = std::time::Duration::from_millis(100);
+            let max_delay = std::time::Duration::from_secs(30);
+            let mut attempt = 0u32;
+
+            loop {
+                match Self::run_generic_forwarder(&client, &channel, &source_id, &callback).await {
+                    Ok(()) => {
+                        attempt = 0;
+                    }
+                    Err(_) => {
+                        attempt += 1;
+                    }
+                }
+                let exp = 2u32.saturating_pow(attempt.min(8));
+                let delay = base_delay.saturating_mul(exp).min(max_delay);
+                tokio::time::sleep(delay).await;
+            }
+        });
+
+        Ok(Box::new(RedisTransportSubscription {
+            abort_handle: handle.abort_handle(),
+        }))
     }
 
     fn clone_box(&self) -> Box<dyn anycms_event::transport::Transport> {

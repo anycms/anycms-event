@@ -4,11 +4,12 @@
 //! pub/sub semantics with back-pressure support.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+use dashmap::DashMap;
 
 use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
@@ -139,7 +140,7 @@ impl Subscription {
     /// This is idempotent — calling it multiple times has no effect.
     pub fn unsubscribe(&self) {
         self.abort_handle.abort();
-        self.inner.tasks.write().unwrap().remove(&self.id);
+        self.inner.tasks.remove(&self.id);
     }
 
     /// Check if this subscription is still active.
@@ -194,12 +195,12 @@ pub struct EventBus {
 
 struct EventBusInner {
     /// Broadcast channels keyed by event name.
-    channels: RwLock<HashMap<String, broadcast::Sender<ErasedEvent>>>,
+    channels: DashMap<String, broadcast::Sender<ErasedEvent>>,
     /// Global channel: every published event is also sent here.
     /// Pattern subscribers listen on this channel and filter with `topic::matches`.
     global_channel: broadcast::Sender<GlobalEvent>,
     /// Registered topic patterns and the event names they match.
-    topic_patterns: RwLock<HashMap<String, Vec<String>>>,
+    topic_patterns: DashMap<String, Vec<String>>,
     /// Monotonically increasing subscription ID counter.
     next_sub_id: AtomicUsize,
     /// Capacity for new broadcast channels.
@@ -214,7 +215,7 @@ struct EventBusInner {
     /// Used by observers like `TriggerRuleEngine` that need to see all events.
     publish_callbacks: RwLock<Vec<PublishCallback>>,
     /// Track spawned subscriber tasks for graceful shutdown.
-    tasks: RwLock<HashMap<usize, JoinHandle<()>>>,
+    tasks: DashMap<usize, JoinHandle<()>>,
     /// 默认重试策略。
     retry_policy: RetryPolicy,
     /// 死信处理器。
@@ -253,16 +254,16 @@ impl EventBus {
         let (global_tx, _) = broadcast::channel(capacity);
         Self {
             inner: Arc::new(EventBusInner {
-                channels: RwLock::new(HashMap::new()),
+                channels: DashMap::new(),
                 global_channel: global_tx,
-                topic_patterns: RwLock::new(HashMap::new()),
+                topic_patterns: DashMap::new(),
                 next_sub_id: AtomicUsize::new(0),
                 capacity,
                 telemetry,
                 registry,
                 execution_log,
                 publish_callbacks: RwLock::new(Vec::new()),
-                tasks: RwLock::new(HashMap::new()),
+                tasks: DashMap::new(),
                 retry_policy,
                 dead_letter,
             }),
@@ -301,20 +302,10 @@ impl EventBus {
 
     /// Get or create a broadcast channel for the given event type.
     ///
-    /// Uses a read-lock fast path: if the channel already exists, it is
-    /// returned without acquiring a write lock. The slow path upgrades to
-    /// a write lock with a double-check to avoid racing with other writers.
+    /// Uses DashMap's atomic entry API for lock-free access on the hot path.
     fn get_or_create_channel<E: Event>(&self) -> broadcast::Sender<ErasedEvent> {
-        // Fast path: read lock
-        {
-            let channels = self.inner.channels.read().unwrap();
-            if let Some(sender) = channels.get(E::event_name()) {
-                return sender.clone();
-            }
-        }
-        // Slow path: write lock (double-check pattern)
-        let mut channels = self.inner.channels.write().unwrap();
-        channels
+        self.inner
+            .channels
             .entry(E::event_name().to_string())
             .or_insert_with(|| {
                 // Auto-register in registry when channel is first created
@@ -350,10 +341,9 @@ impl EventBus {
         // Extract JSON for publish callbacks (before moving event)
         let event_json = event.to_json();
 
-        // Fast path: check if channel exists with read lock
+        // Fast path: check if channel exists with DashMap
         let sender = {
-            let channels = self.inner.channels.read().unwrap();
-            match channels.get(E::event_name()) {
+            match self.inner.channels.get(E::event_name()) {
                 Some(sender) if sender.receiver_count() > 0 => Some(sender.clone()),
                 Some(_) => {
                     // Channel exists but no subscribers
@@ -617,10 +607,7 @@ impl EventBus {
         let abort_handle = handle.abort_handle();
 
         // Store JoinHandle for graceful shutdown
-        {
-            let mut tasks = self.inner.tasks.write().unwrap();
-            tasks.insert(id, handle);
-        }
+        self.inner.tasks.insert(id, handle);
 
         // Telemetry: subscriber registered
         if let Some(ref tel) = self.inner.telemetry {
@@ -689,13 +676,11 @@ impl EventBus {
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         // Register the pattern for bookkeeping
-        {
-            let mut patterns = self.inner.topic_patterns.write().unwrap();
-            patterns
-                .entry(pattern.to_string())
-                .or_default()
-                .push(E::event_name().to_string());
-        }
+        self.inner
+            .topic_patterns
+            .entry(pattern.to_string())
+            .or_default()
+            .push(E::event_name().to_string());
 
         let mut rx = self.inner.global_channel.subscribe();
         let event_name = E::event_name().to_string();
@@ -816,10 +801,7 @@ impl EventBus {
         let abort_handle = handle.abort_handle();
 
         // Store JoinHandle for graceful shutdown
-        {
-            let mut tasks = self.inner.tasks.write().unwrap();
-            tasks.insert(id, handle);
-        }
+        self.inner.tasks.insert(id, handle);
 
         // Telemetry: subscriber registered
         if let Some(ref tel) = self.inner.telemetry {
@@ -840,15 +822,14 @@ impl EventBus {
     /// for a fast shutdown during application termination.
     pub fn shutdown(&self) {
         // Abort all subscriber tasks
-        let tasks: Vec<(usize, JoinHandle<()>)> = {
-            let mut tasks_lock = self.inner.tasks.write().unwrap();
-            std::mem::take(&mut *tasks_lock).into_iter().collect()
-        };
-        for (_, handle) in tasks {
-            handle.abort();
+        let task_ids: Vec<usize> = self.inner.tasks.iter().map(|e| *e.key()).collect();
+        for id in task_ids {
+            if let Some((_, handle)) = self.inner.tasks.remove(&id) {
+                handle.abort();
+            }
         }
         // Clear per-event channels so any remaining receivers get Closed
-        self.inner.channels.write().unwrap().clear();
+        self.inner.channels.clear();
     }
 
     /// Gracefully shut down the event bus, waiting for subscriber tasks to complete.
@@ -860,12 +841,18 @@ impl EventBus {
     /// Returns `0` on success (all tasks completed within the timeout).
     pub async fn shutdown_graceful(&self, timeout: std::time::Duration) -> usize {
         // Clear channels first so no new events arrive
-        self.inner.channels.write().unwrap().clear();
+        self.inner.channels.clear();
 
         // Collect all task handles
         let tasks: Vec<(usize, JoinHandle<()>)> = {
-            let mut tasks_lock = self.inner.tasks.write().unwrap();
-            std::mem::take(&mut *tasks_lock).into_iter().collect()
+            let mut handles = Vec::new();
+            let keys: Vec<usize> = self.inner.tasks.iter().map(|e| *e.key()).collect();
+            for key in keys {
+                if let Some(entry) = self.inner.tasks.remove(&key) {
+                    handles.push(entry);
+                }
+            }
+            handles
         };
 
         let total = tasks.len();

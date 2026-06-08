@@ -19,3 +19,6 @@ pub use crate::trigger::{
     TriggerRule, TriggerRuleEngine, TriggerContext, TriggerEvent,
     RuleStorage, InMemoryRuleStorage,
 };
+
+#[cfg(feature = "prometheus")]
+pub use crate::telemetry_metrics::MetricsTelemetry;
