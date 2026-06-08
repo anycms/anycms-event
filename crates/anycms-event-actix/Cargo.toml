@@ -8,7 +8,7 @@ homepage.workspace = true
 
 [dependencies]
 anycms-event.workspace = true
-anycms-event-sse = { path = "../anycms-event-sse", optional = true }
+anycms-event-sse = { workspace = true, optional = true }
 actix-web = "4"
 tokio = { workspace = true, features = ["sync", "time"] }
 futures-util.workspace = true

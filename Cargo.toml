@@ -25,6 +25,8 @@ futures-util = "0.3"
 dashmap = "6"
 anycms-event-derive = { version = "0.1.4", path = "crates/anycms-event-derive", registry = "r404" }
 anycms-event = { version = "0.1.4", path = ".", registry = "r404" }
+anycms-event-sse = { version = "0.1.4", path = "crates/anycms-event-sse", registry = "r404" }
+anycms-event-redis = { version = "0.1.4", path = "crates/anycms-event-redis", registry = "r404" }
 
 # ── anycms-event (core) ──────────────────────────────────────
 
@@ -42,7 +44,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-dashmap = "6"
+dashmap.workspace = true
 anycms-event-derive.workspace = true
 prometheus = { version = "0.13", optional = true }
 
