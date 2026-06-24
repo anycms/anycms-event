@@ -10,7 +10,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 license = "MIT"
 homepage = "https://anycms.org"
 repository = "https://github.com/anycms/anycms-event"
@@ -27,10 +27,10 @@ thiserror = "2"
 tracing = "0.1"
 futures-util = "0.3"
 dashmap = "6"
-anycms-event-derive = { version = "0.1.4", path = "crates/anycms-event-derive" }
-anycms-event = { version = "0.1.4", path = "." }
-anycms-event-sse = { version = "0.1.4", path = "crates/anycms-event-sse" }
-anycms-event-redis = { version = "0.1.4", path = "crates/anycms-event-redis" }
+anycms-event-derive = { version = "0.1.5", path = "crates/anycms-event-derive" }
+anycms-event = { version = "0.1.5", path = "." }
+anycms-event-sse = { version = "0.1.5", path = "crates/anycms-event-sse" }
+anycms-event-redis = { version = "0.1.5", path = "crates/anycms-event-redis" }
 
 # ── anycms-event (core) ──────────────────────────────────────
 

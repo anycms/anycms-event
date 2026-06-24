@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "actix-web",
  "anycms-event-derive",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event-actix"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "actix-web",
  "anycms-event",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event-axum"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anycms-event",
  "anycms-event-sse",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event-derive"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event-redis"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anycms-event",
  "futures-util",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "anycms-event-sse"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "actix-web",
  "anycms-event",
