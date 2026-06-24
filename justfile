@@ -1,11 +1,11 @@
 
 publish:
-    cargo publish --registry r404 -p anycms-event-derive
-    cargo publish --registry r404 -p anycms-event
-    cargo publish --registry r404 -p anycms-event-sse
-    cargo publish --registry r404 -p anycms-event-redis
-    cargo publish --registry r404 -p anycms-event-actix
-    cargo publish --registry r404 -p anycms-event-axum
+    cargo publish --registry crates-io -p anycms-event-derive
+    cargo publish --registry crates-io -p anycms-event
+    cargo publish --registry crates-io -p anycms-event-sse
+    cargo publish --registry crates-io -p anycms-event-redis
+    cargo publish --registry crates-io -p anycms-event-actix
+    cargo publish --registry crates-io -p anycms-event-axum
 
 release-patch:
     cargo release patch --no-publish --execute

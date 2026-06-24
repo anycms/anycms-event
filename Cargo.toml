@@ -13,7 +13,11 @@ resolver = "3"
 version = "0.1.4"
 license = "MIT"
 homepage = "https://anycms.org"
+repository = "https://github.com/anycms/anycms-event"
+authors = ["Liangdi <wu@liangdi.me>"]
 edition = "2024"
+keywords = ["event-bus", "async", "tokio", "events", "pubsub"]
+categories = ["asynchronous", "concurrency"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
@@ -23,10 +27,10 @@ thiserror = "2"
 tracing = "0.1"
 futures-util = "0.3"
 dashmap = "6"
-anycms-event-derive = { version = "0.1.4", path = "crates/anycms-event-derive", registry = "r404" }
-anycms-event = { version = "0.1.4", path = ".", registry = "r404" }
-anycms-event-sse = { version = "0.1.4", path = "crates/anycms-event-sse", registry = "r404" }
-anycms-event-redis = { version = "0.1.4", path = "crates/anycms-event-redis", registry = "r404" }
+anycms-event-derive = { version = "0.1.4", path = "crates/anycms-event-derive" }
+anycms-event = { version = "0.1.4", path = "." }
+anycms-event-sse = { version = "0.1.4", path = "crates/anycms-event-sse" }
+anycms-event-redis = { version = "0.1.4", path = "crates/anycms-event-redis" }
 
 # ── anycms-event (core) ──────────────────────────────────────
 
@@ -37,6 +41,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/anycms-event"
 
 [dependencies]
 tokio = { workspace = true, features = ["time"] }

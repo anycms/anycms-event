@@ -1,5 +1,13 @@
 # anycms-event
 
+[![Crates.io](https://img.shields.io/crates/v/anycms-event.svg)](https://crates.io/crates/anycms-event)
+[![Documentation](https://docs.rs/anycms-event/badge.svg)](https://docs.rs/anycms-event)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Crates.io](https://img.shields.io/crates/d/anycms-event.svg)](https://crates.io/crates/anycms-event)
+[![GitHub stars](https://img.shields.io/github/stars/anycms/anycms-event.svg)](https://github.com/anycms/anycms-event)
+[![GitHub last commit](https://img.shields.io/github/last-commit/anycms/anycms-event.svg)](https://github.com/anycms/anycms-event)
+
 A type-safe, async event bus system for AnyCMS, built on tokio broadcast channels.
 
 类型安全的异步事件总线，基于 tokio broadcast channels 实现，支持本地进程内通信与 Redis 跨进程分布式通信。
